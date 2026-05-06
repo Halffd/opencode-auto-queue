@@ -613,9 +613,22 @@ export const AutoQueuePlugin = {
       }
     },
 
-    "chat.message": async (input: any, output: any) => {
-      if (currentMode !== "hold") return;
-      if (isInternalMessage(output.parts)) return;
+  "chat.message": async (input: any, output: any) => {
+    if (currentMode !== "hold") return;
+    if (isInternalMessage(output.parts)) return;
+
+    const parts = output.parts ?? [];
+    const isUserMessage = parts.some((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
+    if (!isUserMessage) return;
+
+    const textParts = parts.filter((p: any) => p.type === "text");
+    const allSystemReminders = textParts.every((p: any) =>
+      typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
+    );
+    if (allSystemReminders) return;
+
+    const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
+    if (allSynthetic) return;
 
     const busy = isBusy(input.sessionID);
     const pendingCount = getPendingCount(queueBySession.get(input.sessionID) ?? []);
