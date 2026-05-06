@@ -4,7 +4,7 @@ Queues outgoing chat messages when the session is busy, automatically draining a
 
 ## Features
 
-- **Hold and immediate modes** — queue messages when busy ("hold"), or send right away ("immediate")
+- **Hold and immediate modes** - queue messages when busy ("hold"), or send right away ("immediate")
 - **Automatic retry** with exponential backoff for transient errors (network, 429 rate-limit, 5xx)
 - **Queue persistence** to disk (JSON file) so queued messages survive restarts
 - **Toast notifications** showing queue status (pending/sending/sent/failed items)
@@ -13,7 +13,7 @@ Queues outgoing chat messages when the session is busy, automatically draining a
 
 ## Installation
 
-Add the plugin to your `opencode.json`:
+In `opencode.json`:
 
 **From GitHub:**
 
@@ -37,7 +37,7 @@ Add the plugin to your `opencode.json`:
 
 ## Tool
 
-The `queue` tool is exposed with the following actions:
+`queue` tool actions:
 
 | Action | Description |
 |--------|-------------|
@@ -55,7 +55,7 @@ The `queue` tool is exposed with the following actions:
 
 ## Configuration
 
-Options can be set in `opencode.json` under the plugin config key:
+Config (in `opencode.json`):
 
 | Option | Default | Description |
 |--------|---------|-------------|
