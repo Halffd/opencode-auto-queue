@@ -590,10 +590,88 @@ export const AutoQueuePlugin = {
     },
   });
 
+  const VALID_SLASH_COMMANDS = ["hold", "immediate", "status", "clear", "pause", "resume", "count"];
+
+  function handleSlashCommand(cmd: string, args: string, sessionID: string): string | null {
+    const normalized = cmd.replace(/^\//, "").toLowerCase();
+    if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
+
+    const queue = queueBySession.get(sessionID) ?? [];
+    const pendingCount = getPendingCount(queue);
+    const busy = isBusy(sessionID);
+    const paused = pausedBySession.has(sessionID);
+    const failedCount = queue.filter((i) => i.status === "failed").length;
+
+    switch (normalized) {
+      case "hold": {
+        if (currentMode === "hold") return `Queue mode: hold (already active)`;
+        currentMode = "hold";
+        schedulePersist();
+        return `Queue mode: hold (messages queued when busy)`;
+      }
+      case "immediate": {
+        if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
+        currentMode = "immediate";
+        schedulePersist();
+        drain(sessionID).catch(() => {});
+        return `Queue mode: immediate (messages sent right away)`;
+      }
+      case "status": {
+        const lines = [
+          `Mode: ${currentMode}`,
+          `Session busy: ${busy}`,
+          `Paused: ${paused}`,
+          `Queued: ${pendingCount}`,
+          `Failed: ${failedCount}`,
+        ];
+        if (queue.length > 0) {
+          lines.push("", "Queue:");
+          queue.forEach((item, i) => {
+            const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
+            lines.push(` ${i + 1}. ${icon} ${item.preview}`);
+          });
+        }
+        return lines.join("\n");
+      }
+      case "clear": {
+        const cleared = queue.length;
+        queueBySession.set(sessionID, []);
+        schedulePersist();
+        showToast(sessionID, true).catch(() => {});
+        return `Cleared ${cleared} messages from queue`;
+      }
+      case "pause": {
+        pausedBySession.add(sessionID);
+        schedulePersist();
+        return "Queue paused.";
+      }
+      case "resume": {
+        pausedBySession.delete(sessionID);
+        schedulePersist();
+        drain(sessionID).catch(() => {});
+        return "Queue resumed. Draining pending messages.";
+      }
+      case "count": {
+        return `${pendingCount} messages in queue (${failedCount} failed)`;
+      }
+      default:
+        return null;
+    }
+  }
+
   return {
     tool: { queue: queueTool },
 
-  event: async ({ event }: { event: any }) => {
+    "command.execute.before": async (
+      input: { command: string; sessionID: string; arguments: string },
+      output: { parts: any[] },
+    ) => {
+      const result = handleSlashCommand(input.command, input.arguments ?? "", input.sessionID);
+      if (result === null) return;
+      output.parts = [{ type: "text", text: result }];
+    },
+
+    event: async ({ event }: { event: any }) => {
     if (event.type === "session.status") {
         const { sessionID, status } = event.properties;
         const busy = status.type !== "idle";
