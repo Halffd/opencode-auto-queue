@@ -448,24 +448,46 @@ export const AutoQueuePlugin = {
     return busyBySession.get(sessionID) ?? false;
   }
 
-  function markBusy(sessionID: string) {
-    busyBySession.set(sessionID, true);
-  }
+function markBusy(sessionID: string) {
+  busyBySession.set(sessionID, true);
+}
 
-  const queueTool = tool({
-    description:
-      "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config. Only switch modes when explicitly requested.",
-    args: {
-      action: tool.schema
-        .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "count", "config"])
-        .optional()
-        .describe("Action to perform"),
-      index: tool.schema
-        .number()
-        .optional()
-        .describe("1-based index for drop"),
-    },
-    async execute({ action, index }: { action?: string; index?: number }, ctx: any) {
+function makeTextItem(sessionID: string, text: string): QueuedItem {
+  const truncate = makeTruncate(previewLength);
+  const extract = makeExtractPreview(truncate);
+  const parts = [{ type: "text", text }];
+  return {
+    sessionID,
+    parts,
+    preview: extract(parts),
+    status: "queued",
+    retries: 0,
+    enqueuedAt: Date.now(),
+  };
+}
+
+const queueTool = tool({
+  description:
+    "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Only switch modes when explicitly requested.",
+  args: {
+    action: tool.schema
+      .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get"])
+      .optional()
+      .describe("Action to perform"),
+    index: tool.schema
+      .number()
+      .optional()
+      .describe("1-based index for drop/delete/get/set"),
+    to: tool.schema
+      .number()
+      .optional()
+      .describe("Target position for reorder"),
+    text: tool.schema
+      .string()
+      .optional()
+      .describe("Text content for insert/append/prepend/set"),
+  },
+  async execute({ action, index, to, text }: { action?: string; index?: number; to?: number; text?: string }, ctx: any) {
       const nextAction = action ?? "status";
       const queue = queueBySession.get(ctx.sessionID) ?? [];
       const pendingCount = getPendingCount(queue);
@@ -584,80 +606,278 @@ export const AutoQueuePlugin = {
         schedulePersist();
         await drain(ctx.sessionID);
         return "Queue resumed. Draining pending messages.";
-      }
+}
 
-      return `Unknown action: ${nextAction}`;
+if (nextAction === "reorder") {
+  const from = index ?? 1;
+  const target = to ?? 1;
+  if (from < 1 || from > queue.length || target < 1 || target > queue.length)
+    return `Index out of range. Queue has ${queue.length} items.`;
+  const [item] = queue.splice(from - 1, 1);
+  queue.splice(target - 1, 0, item);
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  return `Moved item ${from} to position ${target}`;
+}
+
+if (nextAction === "insert") {
+  const idx = index ?? 1;
+  if (!text) return "No text provided.";
+  if (idx < 1 || idx > queue.length + 1) return `Index out of range. Queue has ${queue.length} items.`;
+  const item = makeTextItem(ctx.sessionID, text);
+  queue.splice(idx - 1, 0, item);
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  return `Inserted at position ${idx}: ${item.preview}`;
+}
+
+if (nextAction === "append") {
+  if (!text) return "No text provided.";
+  const item = makeTextItem(ctx.sessionID, text);
+  queue.push(item);
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  return `Appended: ${item.preview}`;
+}
+
+if (nextAction === "prepend") {
+  if (!text) return "No text provided.";
+  const item = makeTextItem(ctx.sessionID, text);
+  queue.unshift(item);
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  try { await showToast(ctx.sessionID); } catch { /* noop */ }
+  return `Prepended: ${item.preview}`;
+}
+
+if (nextAction === "delete") {
+  const idx = index ?? 1;
+  if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+  const dropped = queue.splice(idx - 1, 1)[0];
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  try { await showToast(ctx.sessionID); } catch { /* noop */ }
+  return `Deleted: ${dropped.preview}`;
+}
+
+if (nextAction === "set") {
+  const idx = index ?? 1;
+  if (!text) return "No text provided.";
+  if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+  const item = makeTextItem(ctx.sessionID, text);
+  queue[idx - 1] = item;
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  return `Set position ${idx}: ${item.preview}`;
+}
+
+if (nextAction === "sort") {
+  queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  return `Sorted ${queue.length} items by time (oldest first)`;
+}
+
+if (nextAction === "invert") {
+  queue.reverse();
+  queueBySession.set(ctx.sessionID, queue);
+  schedulePersist();
+  return `Reversed ${queue.length} items`;
+}
+
+if (nextAction === "get") {
+  const idx = index ?? 1;
+  if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+  const item = queue[idx - 1];
+  const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
+  const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
+  const err = item.lastError ? `\nError: ${item.lastError}` : "";
+  const textParts = item.parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
+  return [
+    `Item ${idx}/${queue.length}  status: ${item.status}  age: ${age}s${retry}${err}`,
+    `Preview: ${item.preview}`,
+    `Content:`,
+    textParts || "(no text content)",
+  ].join("\n");
+}
+
+return `Unknown action: ${nextAction}`;
     },
   });
 
-  const VALID_SLASH_COMMANDS = ["hold", "immediate", "status", "clear", "pause", "resume", "count"];
+const VALID_SLASH_COMMANDS = [
+  "hold", "immediate", "status", "clear", "pause", "resume", "count",
+  "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get",
+];
 
-  function handleSlashCommand(cmd: string, args: string, sessionID: string): string | null {
-    const normalized = cmd.replace(/^\//, "").toLowerCase();
-    if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
+function parseIndex(arg: string): number | null {
+  const n = parseInt(arg, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 
-    const queue = queueBySession.get(sessionID) ?? [];
-    const pendingCount = getPendingCount(queue);
-    const busy = isBusy(sessionID);
-    const paused = pausedBySession.has(sessionID);
-    const failedCount = queue.filter((i) => i.status === "failed").length;
+function handleSlashCommand(cmd: string, args: string, sessionID: string): string | null {
+  const normalized = cmd.replace(/^\//, "").toLowerCase();
+  if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
 
-    switch (normalized) {
-      case "hold": {
-        if (currentMode === "hold") return `Queue mode: hold (already active)`;
-        currentMode = "hold";
-        schedulePersist();
-        return `Queue mode: hold (messages queued when busy)`;
-      }
-      case "immediate": {
-        if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
-        currentMode = "immediate";
-        schedulePersist();
-        drain(sessionID).catch(() => {});
-        return `Queue mode: immediate (messages sent right away)`;
-      }
-      case "status": {
-        const lines = [
-          `Mode: ${currentMode}`,
-          `Session busy: ${busy}`,
-          `Paused: ${paused}`,
-          `Queued: ${pendingCount}`,
-          `Failed: ${failedCount}`,
-        ];
-        if (queue.length > 0) {
-          lines.push("", "Queue:");
-          queue.forEach((item, i) => {
-            const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
-            lines.push(` ${i + 1}. ${icon} ${item.preview}`);
-          });
-        }
-        return lines.join("\n");
-      }
-      case "clear": {
-        const cleared = queue.length;
-        queueBySession.set(sessionID, []);
-        schedulePersist();
-        showToast(sessionID, true).catch(() => {});
-        return `Cleared ${cleared} messages from queue`;
-      }
-      case "pause": {
-        pausedBySession.add(sessionID);
-        schedulePersist();
-        return "Queue paused.";
-      }
-      case "resume": {
-        pausedBySession.delete(sessionID);
-        schedulePersist();
-        drain(sessionID).catch(() => {});
-        return "Queue resumed. Draining pending messages.";
-      }
-      case "count": {
-        return `${pendingCount} messages in queue (${failedCount} failed)`;
-      }
-      default:
-        return null;
-    }
+  const queue = queueBySession.get(sessionID) ?? [];
+  const pendingCount = getPendingCount(queue);
+  const busy = isBusy(sessionID);
+  const paused = pausedBySession.has(sessionID);
+  const failedCount = queue.filter((i) => i.status === "failed").length;
+
+  switch (normalized) {
+  case "hold": {
+    if (currentMode === "hold") return `Queue mode: hold (already active)`;
+    currentMode = "hold";
+    schedulePersist();
+    return `Queue mode: hold (messages queued when busy)`;
   }
+  case "immediate": {
+    if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
+    currentMode = "immediate";
+    schedulePersist();
+    drain(sessionID).catch(() => {});
+    return `Queue mode: immediate (messages sent right away)`;
+  }
+  case "status": {
+    const lines = [
+      `Mode: ${currentMode}`,
+      `Session busy: ${busy}`,
+      `Paused: ${paused}`,
+      `Queued: ${pendingCount}`,
+      `Failed: ${failedCount}`,
+    ];
+    if (queue.length > 0) {
+      lines.push("", "Queue:");
+      queue.forEach((item, i) => {
+        const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
+        lines.push(` ${i + 1}. ${icon} ${item.preview}`);
+      });
+    }
+    return lines.join("\n");
+  }
+  case "clear": {
+    const cleared = queue.length;
+    queueBySession.set(sessionID, []);
+    schedulePersist();
+    showToast(sessionID, true).catch(() => {});
+    return `Cleared ${cleared} messages from queue`;
+  }
+  case "pause": {
+    pausedBySession.add(sessionID);
+    schedulePersist();
+    return "Queue paused.";
+  }
+  case "resume": {
+    pausedBySession.delete(sessionID);
+    schedulePersist();
+    drain(sessionID).catch(() => {});
+    return "Queue resumed. Draining pending messages.";
+  }
+  case "count": {
+    return `${pendingCount} messages in queue (${failedCount} failed)`;
+  }
+  case "reorder": {
+    const parts = args.trim().split(/\s+/);
+    const from = parseIndex(parts[0]);
+    const to = parseIndex(parts[1]);
+    if (!from || !to) return "Usage: /reorder <from> <to>  (1-based indices)";
+    if (from > queue.length || to > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+    const [item] = queue.splice(from - 1, 1);
+    queue.splice(to - 1, 0, item);
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    return `Moved item ${from} to position ${to}`;
+  }
+  case "insert": {
+    const firstSpace = args.indexOf(" ");
+    if (firstSpace === -1) return "Usage: /insert <index> <text>";
+    const idx = parseIndex(args.slice(0, firstSpace));
+    const text = args.slice(firstSpace + 1).trim();
+    if (!idx) return "Invalid index. Must be a positive number.";
+    if (!text) return "No text provided.";
+    if (idx > queue.length + 1) return `Index out of range. Queue has ${queue.length} items.`;
+    const item = makeTextItem(sessionID, text);
+    queue.splice(idx - 1, 0, item);
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    return `Inserted at position ${idx}: ${item.preview}`;
+  }
+  case "append": {
+    const text = args.trim();
+    if (!text) return "Usage: /append <text>";
+    const item = makeTextItem(sessionID, text);
+    queue.push(item);
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    return `Appended: ${item.preview}`;
+  }
+  case "prepend": {
+    const text = args.trim();
+    if (!text) return "Usage: /prepend <text>";
+    const item = makeTextItem(sessionID, text);
+    queue.unshift(item);
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    showToast(sessionID).catch(() => {});
+    return `Prepended: ${item.preview}`;
+  }
+  case "delete": {
+    const idx = parseIndex(args.trim());
+    if (!idx) return "Usage: /delete <index>  (1-based)";
+    if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+    const dropped = queue.splice(idx - 1, 1)[0];
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    showToast(sessionID).catch(() => {});
+    return `Deleted: ${dropped.preview}`;
+  }
+  case "set": {
+    const firstSpace = args.indexOf(" ");
+    if (firstSpace === -1) return "Usage: /set <index> <text>";
+    const idx = parseIndex(args.slice(0, firstSpace));
+    const text = args.slice(firstSpace + 1).trim();
+    if (!idx) return "Invalid index.";
+    if (!text) return "No text provided.";
+    if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+    const item = makeTextItem(sessionID, text);
+    queue[idx - 1] = item;
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    return `Set position ${idx}: ${item.preview}`;
+  }
+  case "sort": {
+    queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    return `Sorted ${queue.length} items by time (oldest first)`;
+  }
+  case "invert": {
+    queue.reverse();
+    queueBySession.set(sessionID, queue);
+    schedulePersist();
+    return `Reversed ${queue.length} items`;
+  }
+  case "get": {
+    const idx = parseIndex(args.trim());
+    if (!idx) return "Usage: /get <index>  (1-based)";
+    if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+    const item = queue[idx - 1];
+    const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
+    const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
+    const err = item.lastError ? `\nError: ${item.lastError}` : "";
+    const textParts = item.parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
+    return [
+      `Item ${idx}/${queue.length}  status: ${item.status}  age: ${age}s${retry}${err}`,
+      `Preview: ${item.preview}`,
+      `Content:`,
+      textParts || "(no text content)",
+    ].join("\n");
+  }
+  default:
+    return null;
+  }
+}
 
   return {
     tool: { queue: queueTool },
