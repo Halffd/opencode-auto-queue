@@ -15,7 +15,17 @@ Queues outgoing chat messages when the session is busy, automatically draining a
 
 In `opencode.json`:
 
-**From GitHub:**
+**npm/bun:**
+
+```json
+{
+  "plugin": [
+    "@Halffd/opencode-auto-queue"
+  ]
+}
+```
+
+**GitHub:**
 
 ```json
 {
@@ -25,7 +35,7 @@ In `opencode.json`:
 }
 ```
 
-**From local path:**
+**Local:**
 
 ```json
 {
