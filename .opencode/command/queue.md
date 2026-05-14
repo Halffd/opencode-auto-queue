@@ -17,6 +17,15 @@ Available actions:
 - `pause` — stop automatic drain (messages accumulate but won't send)
 - `resume` — resume automatic drain after pause
 - `count` — show number of pending messages
+- `reorder FROM TO` — move item at 1-based index FROM to position TO
+- `insert N TEXT` — insert text at 1-based position N
+- `append TEXT` — add text to end of queue
+- `prepend TEXT` — add text to front of queue
+- `delete N` — remove item at 1-based index N
+- `set N TEXT` — replace item at 1-based index N with new text
+- `sort` — sort queue by enqueue time (oldest first)
+- `invert` — reverse queue order
+- `get N` — show full content of item at 1-based index N
 
 Configuration (in opencode.json plugin options):
 - `defaultMode` — "hold" (default) or "immediate"

@@ -715,8 +715,14 @@ function parseIndex(arg: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function normalizeCommandName(cmd: string): string {
+  let name = cmd.replace(/^\//, "").toLowerCase();
+  if (name.startsWith("queue-")) name = name.slice("queue-".length);
+  return name;
+}
+
 function handleSlashCommand(cmd: string, args: string, sessionID: string): string | null {
-  const normalized = cmd.replace(/^\//, "").toLowerCase();
+  const normalized = normalizeCommandName(cmd);
   if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
 
   const queue = queueBySession.get(sessionID) ?? [];
@@ -879,17 +885,38 @@ function handleSlashCommand(cmd: string, args: string, sessionID: string): strin
   }
 }
 
+  const queueCommands: Record<string, { template: string; description: string }> = {
+    "queue-hold": { template: "$ARGUMENTS", description: "Switch queue to hold mode (auto-drain on idle)" },
+    "queue-immediate": { template: "$ARGUMENTS", description: "Switch queue to immediate mode" },
+    "queue-status": { template: "$ARGUMENTS", description: "Show queue status" },
+    "queue-clear": { template: "$ARGUMENTS", description: "Clear the queue" },
+    "queue-pause": { template: "$ARGUMENTS", description: "Pause auto-drain" },
+    "queue-resume": { template: "$ARGUMENTS", description: "Resume auto-drain" },
+    "queue-count": { template: "$ARGUMENTS", description: "Show pending item count" },
+    "queue-reorder": { template: "$ARGUMENTS", description: "Reorder: /queue-reorder <from> <to>" },
+    "queue-insert": { template: "$ARGUMENTS", description: "Insert: /queue-insert <pos> <text>" },
+    "queue-append": { template: "$ARGUMENTS", description: "Append text to queue" },
+    "queue-prepend": { template: "$ARGUMENTS", description: "Prepend text to queue" },
+    "queue-delete": { template: "$ARGUMENTS", description: "Delete: /queue-delete <index>" },
+    "queue-set": { template: "$ARGUMENTS", description: "Set: /queue-set <index> <text>" },
+    "queue-sort": { template: "$ARGUMENTS", description: "Sort queue by time" },
+    "queue-invert": { template: "$ARGUMENTS", description: "Reverse queue order" },
+    "queue-get": { template: "$ARGUMENTS", description: "Get: /queue-get <index>" },
+  };
+
   return {
     tool: { queue: queueTool },
 
-    "command.execute.before": async (
-      input: { command: string; sessionID: string; arguments: string },
-      output: { parts: any[] },
-    ) => {
-      const result = handleSlashCommand(input.command, input.arguments ?? "", input.sessionID);
-      if (result === null) return;
-      output.parts = [{ type: "text", text: result }];
-    },
+    config: async (inputConfig: any) => {},
+
+      "command.execute.before": async (
+        input: { command: string; sessionID: string; arguments: string },
+        output: { parts: any[] },
+      ) => {
+        const result = handleSlashCommand(input.command, input.arguments ?? "", input.sessionID);
+        if (result === null) return;
+        output.parts = markInternalParts([{ type: "text", text: result }]);
+      },
 
     event: async ({ event }: { event: any }) => {
     if (event.type === "session.status") {
@@ -911,31 +938,45 @@ function handleSlashCommand(cmd: string, args: string, sessionID: string): strin
       }
     },
 
-  "chat.message": async (input: any, output: any) => {
-    if (currentMode !== "hold") return;
-    if (isInternalMessage(output.parts)) return;
+      "chat.message": async (input: any, output: any) => {
+        if (currentMode !== "hold") return;
+        if (isInternalMessage(output.parts)) return;
 
-    const parts = output.parts ?? [];
-    const isUserMessage = parts.some((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
-    if (!isUserMessage) return;
+        const parts = output.parts ?? [];
+        const firstText = parts.find((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
+        if (firstText) {
+          const trimmed = firstText.text.trim();
+          if (trimmed.startsWith("/queue-") || trimmed.startsWith("/queue ")) {
+            const cmdName = trimmed.replace(/^\//, "").split(/\s+/)[0];
+            const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
+            const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
+            if (result !== null) {
+              output.parts.length = 0;
+              output.parts.push(...markInternalParts([{ type: "text", text: result }]));
+              return;
+            }
+          }
+        }
 
-    const textParts = parts.filter((p: any) => p.type === "text");
-    const allSystemReminders = textParts.every((p: any) =>
-      typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
-    );
-    if (allSystemReminders) return;
+        if (draining.has(input.sessionID)) return;
 
-    const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
-    if (allSynthetic) return;
+ const textParts = parts.filter((p: any) => p.type === "text");
+      const allSystemReminders = textParts.every((p: any) =>
+        typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
+      );
+      if (allSystemReminders) return;
 
-    const busy = isBusy(input.sessionID);
-    const pendingCount = getPendingCount(queueBySession.get(input.sessionID) ?? []);
-    const shouldQueue = busy || draining.has(input.sessionID) || pendingCount > 0;
+      const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
+      if (allSynthetic) return;
 
-    if (!shouldQueue) {
-      markBusy(input.sessionID);
-      return;
-    }
+      const busy = isBusy(input.sessionID);
+      const pendingCount = getPendingCount(queueBySession.get(input.sessionID) ?? []);
+      const shouldQueue = busy || pendingCount > 0;
+
+      if (!shouldQueue) {
+        markBusy(input.sessionID);
+        return;
+      }
 
     const queue = getQueue(input.sessionID);
     if (queue.length >= maxQueueSize) {
