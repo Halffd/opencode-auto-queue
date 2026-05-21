@@ -520,7 +520,7 @@ export const AutoQueuePlugin = {
     }
 
   function isBusy(sessionID: string): boolean {
-    return busyBySession.get(sessionID) === true || sendingBySession.has(sessionID);
+    return busyBySession.get(sessionID) === true || sendingBySession.has(sessionID) || draining.has(sessionID);
   }
 
   function markBusy(sessionID: string) {
