@@ -274,10 +274,9 @@ export const AutoQueuePlugin = {
 
     const resolvedPersistPath = persistPath || `${ctx.directory}/.git/queue.json`;
 
-     let currentMode: string = defaultMode;
-  const busyBySession = new Map<string, boolean>();
-  const sendingBySession = new Set<string>();
-  const queueBySession = new Map<string, QueuedItem[]>();
+ let currentMode: string = defaultMode;
+ const busyBySession = new Map<string, boolean>();
+ const queueBySession = new Map<string, QueuedItem[]>();
   const draining = new Set<string>();
   const pausedBySession = new Set<string>();
      let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -518,14 +517,13 @@ export const AutoQueuePlugin = {
  }
     }
 
-  function isBusy(sessionID: string): boolean {
-    return busyBySession.get(sessionID) === true || sendingBySession.has(sessionID) || draining.has(sessionID);
-  }
+ function isBusy(sessionID: string): boolean {
+ return busyBySession.get(sessionID) ?? false;
+ }
 
-  function markBusy(sessionID: string) {
-    busyBySession.set(sessionID, true);
-    sendingBySession.add(sessionID);
-  }
+ function markBusy(sessionID: string) {
+ busyBySession.set(sessionID, true);
+ }
 
     function makeTextItem(sessionID: string, text: string): QueuedItem {
       const truncate = makeTruncate(previewLength);
@@ -993,26 +991,24 @@ export const AutoQueuePlugin = {
       },
 
   event: async ({ event }: { event: any }) => {
-        if (event.type === "session.status") {
-          const { sessionID, status } = event.properties;
-          const busy = status.type !== "idle";
-          busyBySession.set(sessionID, busy);
-          if (busy) sendingBySession.add(sessionID);
-          if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
-            await drain(sessionID);
-          }
-          return;
-        }
+ if (event.type === "session.status") {
+ const { sessionID, status } = event.properties;
+ const busy = status.type !== "idle";
+ busyBySession.set(sessionID, busy);
+ if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+ await drain(sessionID);
+ }
+ return;
+ }
 
-        if (event.type === "session.idle") {
-          const { sessionID } = event.properties;
-          busyBySession.set(sessionID, false);
-          sendingBySession.delete(sessionID);
-          if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
-            await drain(sessionID);
-          }
-        }
-  },
+ if (event.type === "session.idle") {
+ const { sessionID } = event.properties;
+ busyBySession.set(sessionID, false);
+ if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+ await drain(sessionID);
+ }
+ }
+ },
 
   "chat.message": async (input: any, output: any) => {
     if (isInternalMessage(output.parts)) return;
@@ -1037,22 +1033,20 @@ export const AutoQueuePlugin = {
     const allSystemReminders = textParts.every((p: any) =>
       typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
     );
-    if (allSystemReminders) return;
+ if (allSystemReminders) return;
 
-    const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
-    if (allSynthetic) return;
+ const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
+ if (allSynthetic) return;
 
-     // Determine if we should send this message immediately or queue it
-      const busy = isBusy(input.sessionID);
-      const queue = getQueue(input.sessionID);
-      if (!busy) {
-        markBusy(input.sessionID);
-        const hasPending = queue.some((item) => item.status === "queued" || item.status === "sending" || item.status === "failed");
-        if (hasPending && currentMode === "immediate" && !pausedBySession.has(input.sessionID)) {
-          drain(input.sessionID).catch(() => {});
-        }
-        return;
-      }
+ if (draining.has(input.sessionID)) return;
+
+ const busy = isBusy(input.sessionID);
+ if (!busy) {
+ markBusy(input.sessionID);
+ return;
+ }
+
+ const queue = getQueue(input.sessionID);
 
      if (queue.length >= maxQueueSize) {
       try {
