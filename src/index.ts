@@ -391,10 +391,10 @@ export const AutoQueuePlugin = {
  const queue = queueBySession.get(sessionID) ?? [];
  const pending = getPendingCount(queue);
  if (pending === 0 && !forceEmpty) return;
- const isEmpty = pending === 0;
- const variant = isEmpty ? "success" : "info";
- const duration = isEmpty ? emptyToastDurationMs : toastDurationMs;
- const message = isEmpty ? "Queue empty. All queued messages sent." : buildToastMessage(queue, maxPreviews);
+ if (pending === 0) return;
+ const variant = "info";
+ const duration = toastDurationMs;
+ const message = buildToastMessage(queue, maxPreviews);
       try {
         await client.tui.showToast({
           body: { title: "Message Queue", message, variant, duration },
@@ -504,6 +504,10 @@ export const AutoQueuePlugin = {
 
  const remaining = queue.filter((item) => item.status !== "sent");
  queueBySession.set(sessionID, remaining);
+
+ if (getPendingCount(remaining) === 0) {
+ busyBySession.set(sessionID, false);
+ }
 
  if (showedEmptyToast && showEmptyToast) {
           await sleep(1500);
@@ -994,7 +998,15 @@ export const AutoQueuePlugin = {
  if (event.type === "session.status") {
  const { sessionID, status } = event.properties;
  const busy = status.type !== "idle";
- busyBySession.set(sessionID, busy);
+ if (busy) {
+ busyBySession.set(sessionID, true);
+ } else {
+ const queue = getQueue(sessionID);
+ const hasPending = getPendingCount(queue) > 0;
+ if (!hasPending) {
+ busyBySession.set(sessionID, false);
+ }
+ }
  if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
  await drain(sessionID);
  }
@@ -1003,7 +1015,11 @@ export const AutoQueuePlugin = {
 
  if (event.type === "session.idle") {
  const { sessionID } = event.properties;
+ const queue = getQueue(sessionID);
+ const hasPending = getPendingCount(queue) > 0;
+ if (!hasPending) {
  busyBySession.set(sessionID, false);
+ }
  if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
  await drain(sessionID);
  }
