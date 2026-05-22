@@ -388,14 +388,14 @@ export const AutoQueuePlugin = {
       return next;
     }
 
-    async function showToast(sessionID: string, forceEmpty = false) {
-      const queue = queueBySession.get(sessionID) ?? [];
-      const pending = getPendingCount(queue);
-      if (queue.length === 0 && !forceEmpty) return;
-      const isEmpty = pending === 0;
-      const variant = isEmpty ? "success" : "info";
-      const duration = isEmpty ? emptyToastDurationMs : toastDurationMs;
-      const message = isEmpty ? "Queue empty. All queued messages sent." : buildToastMessage(queue, maxPreviews);
+ async function showToast(sessionID: string, forceEmpty = false) {
+ const queue = queueBySession.get(sessionID) ?? [];
+ const pending = getPendingCount(queue);
+ if (pending === 0 && !forceEmpty) return;
+ const isEmpty = pending === 0;
+ const variant = isEmpty ? "success" : "info";
+ const duration = isEmpty ? emptyToastDurationMs : toastDurationMs;
+ const message = isEmpty ? "Queue empty. All queued messages sent." : buildToastMessage(queue, maxPreviews);
       try {
         await client.tui.showToast({
           body: { title: "Message Queue", message, variant, duration },
@@ -498,25 +498,24 @@ export const AutoQueuePlugin = {
             try {
               await showToast(sessionID);
             } catch { /* TUI may not be active */ }
-          } else {
-            showedEmptyToast = true;
-          }
-        }
+ } else if (currentMode === "hold") {
+ showedEmptyToast = true;
+ }
+ }
 
-        const remaining = queue.filter((item) => item.status !== "sent");
-        queueBySession.set(sessionID, remaining);
+ const remaining = queue.filter((item) => item.status !== "sent");
+ queueBySession.set(sessionID, remaining);
 
-        if (showedEmptyToast && showEmptyToast) {
+ if (showedEmptyToast && showEmptyToast) {
           await sleep(1500);
           try {
             await showToast(sessionID, remaining.length === 0);
           } catch { /* TUI may not be active */ }
         }
       schedulePersist();
-  } finally {
-    draining.delete(sessionID);
-    sendingBySession.delete(sessionID);
-  }
+ } finally {
+ draining.delete(sessionID);
+ }
     }
 
   function isBusy(sessionID: string): boolean {
