@@ -1004,10 +1004,6 @@ const VALID_SLASH_COMMANDS = [
 
       if (!shouldQueue) {
         markBusy(input.sessionID);
-        const queue = queueBySession.get(input.sessionID) ?? [];
-        if (getPendingCount(queue) > 0 && !pausedBySession.has(input.sessionID)) {
-          drainOne(input.sessionID).catch(() => { });
-        }
         return;
       }
 
