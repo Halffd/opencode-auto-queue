@@ -354,6 +354,7 @@ export const AutoQueuePlugin = {
     if (!next) return;
     draining.add(sessionID);
     activeSubmissionBySession.add(sessionID);
+    markBusy(sessionID);
     try {
       if (drainDelayMs > 0) await sleep(drainDelayMs);
       next.status = "sending";
