@@ -92,17 +92,7 @@ async function loadState(filePath: string): Promise<PersistedState | null> {
   }
 }
 
-async function saveState(filePath: string, state: PersistedState): Promise<void> {
-  try {
-    const dir = filePath.substring(0, filePath.lastIndexOf("/"));
-    await Bun.write(dir + "/.gitkeep", "");
-    await Bun.write(filePath, JSON.stringify(state));
-  } catch {
-    // persistence failure is non-fatal
-  }
-}
-
-function makeTruncate(previewLength: number) {
+  function makeTruncate(previewLength: number) {
   return function truncatePreview(text: string): string {
     const len = previewLength;
     const trimmed = text.replace(/\s+/g, " ").trim();
@@ -267,29 +257,52 @@ export const AutoQueuePlugin = {
 
     const resolvedPersistPath = persistPath || `${ctx.directory}/.opencode/queue-state.json`;
 
-  let currentMode: string = defaultMode;
-  const busyBySession = new Map<string, boolean>();
-  const queueBySession = new Map<string, QueuedItem[]>();
-  const draining = new Set<string>();
-  const pausedBySession = new Set<string>();
-  const activeSubmissionBySession = new Set<string>();
-  const cancelledBySession = new Set<string>();
+    let currentMode: string = defaultMode;
+
+    const stateBySession = new Map<string, {
+      modelBusy: boolean;
+      queueOwner: boolean;
+      cancelled: boolean;
+      paused: boolean;
+      queue: QueuedItem[];
+    }>();
+
+    const workerRunning = new Set<string>();
+
     let persistTimer: ReturnType<typeof setTimeout> | null = null;
+    let persistDirEnsured = false;
+
+    function getSession(sessionID: string) {
+      let s = stateBySession.get(sessionID);
+      if (!s) {
+        s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [] };
+        stateBySession.set(sessionID, s);
+      }
+      return s;
+    }
 
     async function persistState() {
       if (!persistQueue) return;
       const queues: Record<string, any[]> = {};
-      for (const [sessionID, queue] of queueBySession.entries()) {
-        const serializable = serializeQueue(queue);
+      const pausedSessions: string[] = [];
+      for (const [sessionID, s] of stateBySession.entries()) {
+        const serializable = serializeQueue(s.queue);
         if (serializable.length > 0) queues[sessionID] = serializable;
+        if (s.paused) pausedSessions.push(sessionID);
       }
       const state: PersistedState = {
         version: 1,
         mode: currentMode,
         queues,
-        pausedSessions: [...pausedBySession],
+        pausedSessions,
       };
-      await saveState(resolvedPersistPath, state);
+      try {
+        if (!persistDirEnsured) {
+          const dir = resolvedPersistPath.substring(0, resolvedPersistPath.lastIndexOf("/"));
+          await Bun.write(dir + "/.gitkeep", "").then(() => { persistDirEnsured = true; }).catch(() => { });
+        }
+        await Bun.write(resolvedPersistPath, JSON.stringify(state));
+      } catch { }
     }
 
     function schedulePersist() {
@@ -307,66 +320,76 @@ export const AutoQueuePlugin = {
       if (!state) return;
       if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
       if (state.pausedSessions) {
-        for (const s of state.pausedSessions) pausedBySession.add(s);
+        for (const sid of state.pausedSessions) getSession(sid).paused = true;
       }
       if (state.queues) {
         for (const [sessionID, items] of Object.entries(state.queues)) {
           const queue = deserializeQueue(items);
-          if (queue.length > 0) queueBySession.set(sessionID, queue);
+          if (queue.length > 0) getSession(sessionID).queue = queue;
         }
       }
     }
 
     await restoreState();
 
-    function getQueue(sessionID: string): QueuedItem[] {
-      const existing = queueBySession.get(sessionID);
-      if (existing) return existing;
-      const next: QueuedItem[] = [];
-      queueBySession.set(sessionID, next);
-      return next;
-    }
-
     async function showToast(sessionID: string, forceEmpty = false) {
-      const queue = queueBySession.get(sessionID) ?? [];
-      const pending = getPendingCount(queue);
-      if (queue.length === 0 && !forceEmpty) return;
+      const s = getSession(sessionID);
+      const pending = getPendingCount(s.queue);
+      if (s.queue.length === 0 && !forceEmpty) return;
       const isEmpty = pending === 0;
       const variant = isEmpty ? "success" : "info";
       const duration = isEmpty ? emptyToastDurationMs : toastDurationMs;
-      const message = isEmpty ? "Queue empty. All queued messages sent." : buildToastMessage(queue, maxPreviews);
+      const message = isEmpty ? "Queue empty. All queued messages sent." : buildToastMessage(s.queue, maxPreviews);
       try {
         await client.tui.showToast({
           body: { title: "Message Queue", message, variant, duration },
         });
       } catch {
-        // TUI may not be active (e.g., API-only usage)
       }
     }
 
-  async function drainOne(sessionID: string) {
-    if (draining.has(sessionID)) return;
-    if (pausedBySession.has(sessionID)) return;
-    if (cancelledBySession.has(sessionID)) return;
-    const queue = queueBySession.get(sessionID) ?? [];
-    if (queue.length === 0) return;
-    const next = queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
-    if (!next) return;
-    draining.add(sessionID);
-    activeSubmissionBySession.add(sessionID);
+    async function tick(sessionID: string) {
+      if (workerRunning.has(sessionID)) return;
+      const s = getSession(sessionID);
+      if (s.queue.length === 0) return;
+      if (s.modelBusy) return;
+      if (s.paused) return;
+      if (s.cancelled) {
+        s.cancelled = false;
+        s.queueOwner = false;
+        return;
+      }
+
+    workerRunning.add(sessionID);
     try {
       if (drainDelayMs > 0) await sleep(drainDelayMs);
+
+      const next = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+      if (!next) return;
+      if (s.modelBusy) return;
+      if (s.paused) return;
+      if (s.cancelled) {
+        s.cancelled = false;
+        s.queueOwner = false;
+        return;
+      }
+
       next.status = "sending";
+      s.queueOwner = true;
       schedulePersist();
-      try {
-        await showToast(sessionID);
-      } catch { /* TUI may not be active */ }
+      try { await showToast(sessionID); } catch { }
 
       let sent = false;
       let attempts = 0;
       const maxAttempts = maxRetries + 1;
 
       while (!sent && attempts < maxAttempts) {
+        if (s.cancelled) {
+          s.cancelled = false;
+          s.queueOwner = false;
+          next.status = "queued";
+          return;
+        }
         attempts++;
         try {
           await client.session.prompt({
@@ -382,6 +405,7 @@ export const AutoQueuePlugin = {
           next.status = "sent";
           next.lastError = undefined;
           sent = true;
+          s.modelBusy = true;
         } catch (error: any) {
           const errMsg = error instanceof Error ? error.message : String(error);
           if (isTransientError(error) && attempts < maxAttempts) {
@@ -398,7 +422,7 @@ export const AutoQueuePlugin = {
                   duration: delay + 2000,
                 },
               });
-            } catch { /* TUI may not be active */ }
+            } catch { }
             await sleep(delay);
             next.status = "queued";
           } else {
@@ -414,31 +438,26 @@ export const AutoQueuePlugin = {
                   duration: toastDurationMs,
                 },
               });
-            } catch { /* TUI may not be active */ }
+            } catch { }
             break;
           }
         }
       }
 
-      const remaining = queue.filter((item) => item.status !== "sent");
-      queueBySession.set(sessionID, remaining);
-
-      const isEmpty = getPendingCount(remaining) === 0;
-      try {
-        await showToast(sessionID, isEmpty);
-      } catch { /* TUI may not be active */ }
+      s.queue = s.queue.filter((item) => item.status !== "sent");
       schedulePersist();
+      try { await showToast(sessionID); } catch { }
+
+      if (!sent && next.status === "failed") {
+        const more = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+        if (more) {
+          s.queueOwner = false;
+          tick(sessionID).catch(() => { });
+        }
+      }
     } finally {
-      draining.delete(sessionID);
+      workerRunning.delete(sessionID);
     }
-  }
-
-    function isBusy(sessionID: string): boolean {
-      return busyBySession.get(sessionID) ?? false;
-    }
-
-    function markBusy(sessionID: string) {
-      busyBySession.set(sessionID, true);
     }
 
     function makeTextItem(sessionID: string, text: string): QueuedItem {
@@ -457,7 +476,7 @@ export const AutoQueuePlugin = {
 
     const queueTool = tool({
       description:
-        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Only switch modes when explicitly requested.",
+        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, cancel, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Only switch modes when explicitly requested.",
       args: {
         action: tool.schema
           .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "cancel", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get"])
@@ -478,28 +497,27 @@ export const AutoQueuePlugin = {
       },
       async execute({ action, index, to, text }: { action?: string; index?: number; to?: number; text?: string }, ctx: any) {
         const nextAction = action ?? "status";
-        const queue = queueBySession.get(ctx.sessionID) ?? [];
-        const pendingCount = getPendingCount(queue);
-        const busy = isBusy(ctx.sessionID);
-        const paused = pausedBySession.has(ctx.sessionID);
-        const failedCount = queue.filter((i) => i.status === "failed").length;
+        const s = getSession(ctx.sessionID);
+        const pendingCount = getPendingCount(s.queue);
+        const failedCount = s.queue.filter((i) => i.status === "failed").length;
 
         if (nextAction === "status") {
           const lines = [
             `Mode: ${currentMode}`,
-            `Session busy: ${busy}`,
-            `Paused: ${paused}`,
+            `Model busy: ${s.modelBusy}`,
+            `Queue owner: ${s.queueOwner}`,
+            `Paused: ${s.paused}`,
             `Queued: ${pendingCount}`,
             `Failed: ${failedCount}`,
             `Persist: ${persistQueue}${persistQueue ? ` (${resolvedPersistPath})` : ""}`,
           ];
-          if (queue.length > 0) {
+          if (s.queue.length > 0) {
             lines.push("", "Queue:");
-            queue.forEach((item, i) => {
+            s.queue.forEach((item, i) => {
               const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
               const retry = item.retries > 0 ? ` (${item.retries} retries)` : "";
               const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
-              lines.push(`  ${i + 1}. ${icon} ${item.preview}${retry} [${age}s ago]`);
+              lines.push(` ${i + 1}. ${icon} ${item.preview}${retry} [${age}s ago]`);
             });
           }
           return lines.join("\n");
@@ -508,21 +526,21 @@ export const AutoQueuePlugin = {
         if (nextAction === "config") {
           return [
             "Queue Configuration:",
-            `  mode: ${currentMode} (default: ${defaultMode})`,
-            `  maxQueueSize: ${maxQueueSize}`,
-            `  maxRetries: ${maxRetries}`,
-            `  retryBaseDelayMs: ${retryBaseDelayMs}`,
-            `  retryMaxDelayMs: ${retryMaxDelayMs}`,
-            `  drainDelayMs: ${drainDelayMs}`,
-            `  autoRetryOnIdle: ${autoRetryOnIdle}`,
-            `  persistQueue: ${persistQueue}`,
-            `  persistPath: ${resolvedPersistPath}`,
-            `  persistDebounceMs: ${persistDebounceMs}`,
-            `  previewLength: ${previewLength}`,
-            `  maxPreviews: ${maxPreviews}`,
-            `  toastDurationMs: ${toastDurationMs}`,
-            `  emptyToastDurationMs: ${emptyToastDurationMs}`,
-            `  placeholderTemplate: "${placeholderTemplate}"`,
+            ` mode: ${currentMode} (default: ${defaultMode})`,
+            ` maxQueueSize: ${maxQueueSize}`,
+            ` maxRetries: ${maxRetries}`,
+            ` retryBaseDelayMs: ${retryBaseDelayMs}`,
+            ` retryMaxDelayMs: ${retryMaxDelayMs}`,
+            ` drainDelayMs: ${drainDelayMs}`,
+            ` autoRetryOnIdle: ${autoRetryOnIdle}`,
+            ` persistQueue: ${persistQueue}`,
+            ` persistPath: ${resolvedPersistPath}`,
+            ` persistDebounceMs: ${persistDebounceMs}`,
+            ` previewLength: ${previewLength}`,
+            ` maxPreviews: ${maxPreviews}`,
+            ` toastDurationMs: ${toastDurationMs}`,
+            ` emptyToastDurationMs: ${emptyToastDurationMs}`,
+            ` placeholderTemplate: "${placeholderTemplate}"`,
           ].join("\n");
         }
 
@@ -531,7 +549,7 @@ export const AutoQueuePlugin = {
         }
 
         if (nextAction === "peek") {
-          const next = queue.find((item) => item.status === "queued" || item.status === "failed");
+          const next = s.queue.find((item) => item.status === "queued" || item.status === "failed");
           if (!next) return "Queue is empty";
           const retry = next.retries > 0 ? ` (retried ${next.retries}x)` : "";
           const age = Math.round((Date.now() - next.enqueuedAt) / 1000);
@@ -549,29 +567,30 @@ export const AutoQueuePlugin = {
           if (currentMode === "immediate") return `Mode: immediate`;
           currentMode = "immediate";
           schedulePersist();
-          await drainOne(ctx.sessionID);
+          tick(ctx.sessionID).catch(() => { });
           return `Mode: immediate (messages sent right away)`;
         }
 
         if (nextAction === "clear") {
-          const cleared = queue.length;
-          queueBySession.set(ctx.sessionID, []);
+          const cleared = s.queue.length;
+          s.queue = [];
+          s.queueOwner = false;
           schedulePersist();
-          try { await showToast(ctx.sessionID, true); } catch { /* noop */ }
+          try { await showToast(ctx.sessionID, true); } catch { }
           return `Cleared ${cleared} messages from queue`;
         }
 
         if (nextAction === "drop") {
           const idx = (index ?? 1) - 1;
-          if (idx < 0 || idx >= queue.length) return `Invalid index. Queue has ${queue.length} items.`;
-          const dropped = queue.splice(idx, 1)[0];
+          if (idx < 0 || idx >= s.queue.length) return `Invalid index. Queue has ${s.queue.length} items.`;
+          const dropped = s.queue.splice(idx, 1)[0];
           schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { /* noop */ }
+          try { await showToast(ctx.sessionID); } catch { }
           return `Dropped: ${dropped.preview}`;
         }
 
         if (nextAction === "retry") {
-          const failedItems = queue.filter((i) => i.status === "failed");
+          const failedItems = s.queue.filter((i) => i.status === "failed");
           if (failedItems.length === 0) return "No failed items to retry.";
           for (const item of failedItems) {
             item.status = "queued";
@@ -579,39 +598,38 @@ export const AutoQueuePlugin = {
             item.lastError = undefined;
           }
           schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { /* noop */ }
-        if (!paused) await drainOne(ctx.sessionID);
-        return `Retrying ${failedItems.length} failed messages`;
+          try { await showToast(ctx.sessionID); } catch { }
+          tick(ctx.sessionID).catch(() => { });
+          return `Retrying ${failedItems.length} failed messages`;
         }
 
         if (nextAction === "pause") {
-          pausedBySession.add(ctx.sessionID);
+          s.paused = true;
           schedulePersist();
           return "Queue paused.";
         }
 
-      if (nextAction === "resume") {
-        pausedBySession.delete(ctx.sessionID);
-        schedulePersist();
-        await drainOne(ctx.sessionID);
-        return "Queue resumed. Draining pending messages.";
-      }
+        if (nextAction === "resume") {
+          s.paused = false;
+          schedulePersist();
+          tick(ctx.sessionID).catch(() => { });
+          return "Queue resumed. Draining pending messages.";
+        }
 
-      if (nextAction === "cancel") {
-        cancelledBySession.add(ctx.sessionID);
-        activeSubmissionBySession.delete(ctx.sessionID);
-        draining.delete(ctx.sessionID);
-        return "Queue drain cancelled. No more items will be auto-sent.";
-      }
+        if (nextAction === "cancel") {
+          s.cancelled = true;
+          s.queueOwner = false;
+          schedulePersist();
+          return "Queue drain cancelled. No more items will be auto-sent.";
+        }
 
         if (nextAction === "reorder") {
           const from = index ?? 1;
           const target = to ?? 1;
-          if (from < 1 || from > queue.length || target < 1 || target > queue.length)
-            return `Index out of range. Queue has ${queue.length} items.`;
-          const [item] = queue.splice(from - 1, 1);
-          queue.splice(target - 1, 0, item);
-          queueBySession.set(ctx.sessionID, queue);
+          if (from < 1 || from > s.queue.length || target < 1 || target > s.queue.length)
+            return `Index out of range. Queue has ${s.queue.length} items.`;
+          const [item] = s.queue.splice(from - 1, 1);
+          s.queue.splice(target - 1, 0, item);
           schedulePersist();
           return `Moved item ${from} to position ${target}`;
         }
@@ -619,10 +637,9 @@ export const AutoQueuePlugin = {
         if (nextAction === "insert") {
           const idx = index ?? 1;
           if (!text) return "No text provided.";
-          if (idx < 1 || idx > queue.length + 1) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > s.queue.length + 1) return `Index out of range. Queue has ${s.queue.length} items.`;
           const item = makeTextItem(ctx.sessionID, text);
-          queue.splice(idx - 1, 0, item);
-          queueBySession.set(ctx.sessionID, queue);
+          s.queue.splice(idx - 1, 0, item);
           schedulePersist();
           return `Inserted at position ${idx}: ${item.preview}`;
         }
@@ -630,8 +647,7 @@ export const AutoQueuePlugin = {
         if (nextAction === "append") {
           if (!text) return "No text provided.";
           const item = makeTextItem(ctx.sessionID, text);
-          queue.push(item);
-          queueBySession.set(ctx.sessionID, queue);
+          s.queue.push(item);
           schedulePersist();
           return `Appended: ${item.preview}`;
         }
@@ -639,58 +655,53 @@ export const AutoQueuePlugin = {
         if (nextAction === "prepend") {
           if (!text) return "No text provided.";
           const item = makeTextItem(ctx.sessionID, text);
-          queue.unshift(item);
-          queueBySession.set(ctx.sessionID, queue);
+          s.queue.unshift(item);
           schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { /* noop */ }
+          try { await showToast(ctx.sessionID); } catch { }
           return `Prepended: ${item.preview}`;
         }
 
         if (nextAction === "delete") {
           const idx = index ?? 1;
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
-          const dropped = queue.splice(idx - 1, 1)[0];
-          queueBySession.set(ctx.sessionID, queue);
+          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const dropped = s.queue.splice(idx - 1, 1)[0];
           schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { /* noop */ }
+          try { await showToast(ctx.sessionID); } catch { }
           return `Deleted: ${dropped.preview}`;
         }
 
         if (nextAction === "set") {
           const idx = index ?? 1;
           if (!text) return "No text provided.";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
           const item = makeTextItem(ctx.sessionID, text);
-          queue[idx - 1] = item;
-          queueBySession.set(ctx.sessionID, queue);
+          s.queue[idx - 1] = item;
           schedulePersist();
           return `Set position ${idx}: ${item.preview}`;
         }
 
         if (nextAction === "sort") {
-          queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
-          queueBySession.set(ctx.sessionID, queue);
+          s.queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
           schedulePersist();
-          return `Sorted ${queue.length} items by time (oldest first)`;
+          return `Sorted ${s.queue.length} items by time (oldest first)`;
         }
 
         if (nextAction === "invert") {
-          queue.reverse();
-          queueBySession.set(ctx.sessionID, queue);
+          s.queue.reverse();
           schedulePersist();
-          return `Reversed ${queue.length} items`;
+          return `Reversed ${s.queue.length} items`;
         }
 
         if (nextAction === "get") {
           const idx = index ?? 1;
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
-          const item = queue[idx - 1];
+          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const item = s.queue[idx - 1];
           const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
           const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
           const err = item.lastError ? `\nError: ${item.lastError}` : "";
           const textParts = item.parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
           return [
-            `Item ${idx}/${queue.length}  status: ${item.status}  age: ${age}s${retry}${err}`,
+            `Item ${idx}/${s.queue.length} status: ${item.status} age: ${age}s${retry}${err}`,
             `Preview: ${item.preview}`,
             `Content:`,
             textParts || "(no text content)",
@@ -701,10 +712,10 @@ export const AutoQueuePlugin = {
       },
     });
 
-const VALID_SLASH_COMMANDS = [
-  "hold", "immediate", "status", "clear", "pause", "resume", "cancel", "count",
-  "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get",
-];
+    const VALID_SLASH_COMMANDS = [
+      "hold", "immediate", "status", "clear", "pause", "resume", "cancel", "count",
+      "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get",
+    ];
 
     function parseIndex(arg: string): number | null {
       const n = parseInt(arg, 10);
@@ -721,11 +732,9 @@ const VALID_SLASH_COMMANDS = [
       const normalized = normalizeCommandName(cmd);
       if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
 
-      const queue = queueBySession.get(sessionID) ?? [];
-      const pendingCount = getPendingCount(queue);
-      const busy = isBusy(sessionID);
-      const paused = pausedBySession.has(sessionID);
-      const failedCount = queue.filter((i) => i.status === "failed").length;
+      const s = getSession(sessionID);
+      const pendingCount = getPendingCount(s.queue);
+      const failedCount = s.queue.filter((i) => i.status === "failed").length;
 
       switch (normalized) {
         case "hold": {
@@ -738,20 +747,21 @@ const VALID_SLASH_COMMANDS = [
           if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
           currentMode = "immediate";
           schedulePersist();
-          drainOne(sessionID).catch(() => { });
+          tick(sessionID).catch(() => { });
           return `Queue mode: immediate (messages sent right away)`;
         }
         case "status": {
           const lines = [
             `Mode: ${currentMode}`,
-            `Session busy: ${busy}`,
-            `Paused: ${paused}`,
+            `Model busy: ${s.modelBusy}`,
+            `Queue owner: ${s.queueOwner}`,
+            `Paused: ${s.paused}`,
             `Queued: ${pendingCount}`,
             `Failed: ${failedCount}`,
           ];
-          if (queue.length > 0) {
+          if (s.queue.length > 0) {
             lines.push("", "Queue:");
-            queue.forEach((item, i) => {
+            s.queue.forEach((item, i) => {
               const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
               lines.push(` ${i + 1}. ${icon} ${item.preview}`);
             });
@@ -759,41 +769,41 @@ const VALID_SLASH_COMMANDS = [
           return lines.join("\n");
         }
         case "clear": {
-          const cleared = queue.length;
-          queueBySession.set(sessionID, []);
+          const cleared = s.queue.length;
+          s.queue = [];
+          s.queueOwner = false;
           schedulePersist();
           showToast(sessionID, true).catch(() => { });
           return `Cleared ${cleared} messages from queue`;
         }
         case "pause": {
-          pausedBySession.add(sessionID);
+          s.paused = true;
           schedulePersist();
           return "Queue paused.";
         }
-    case "resume": {
-      pausedBySession.delete(sessionID);
-      schedulePersist();
-      drainOne(sessionID).catch(() => { });
-      return "Queue resumed. Draining pending messages.";
-    }
-    case "cancel": {
-      cancelledBySession.add(sessionID);
-      activeSubmissionBySession.delete(sessionID);
-      draining.delete(sessionID);
-      return "Queue drain cancelled. No more items will be auto-sent.";
-    }
-    case "count": {
+        case "resume": {
+          s.paused = false;
+          schedulePersist();
+          tick(sessionID).catch(() => { });
+          return "Queue resumed. Draining pending messages.";
+        }
+        case "cancel": {
+          s.cancelled = true;
+          s.queueOwner = false;
+          schedulePersist();
+          return "Queue drain cancelled. No more items will be auto-sent.";
+        }
+        case "count": {
           return `${pendingCount} messages in queue (${failedCount} failed)`;
         }
         case "reorder": {
           const parts = args.trim().split(/\s+/);
           const from = parseIndex(parts[0]);
           const to = parseIndex(parts[1]);
-          if (!from || !to) return "Usage: /reorder <from> <to>  (1-based indices)";
-          if (from > queue.length || to > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
-          const [item] = queue.splice(from - 1, 1);
-          queue.splice(to - 1, 0, item);
-          queueBySession.set(sessionID, queue);
+          if (!from || !to) return "Usage: /reorder <from> <to> (1-based indices)";
+          if (from > s.queue.length || to > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const [item] = s.queue.splice(from - 1, 1);
+          s.queue.splice(to - 1, 0, item);
           schedulePersist();
           return `Moved item ${from} to position ${to}`;
         }
@@ -801,41 +811,37 @@ const VALID_SLASH_COMMANDS = [
           const firstSpace = args.indexOf(" ");
           if (firstSpace === -1) return "Usage: /insert <index> <text>";
           const idx = parseIndex(args.slice(0, firstSpace));
-          const text = args.slice(firstSpace + 1).trim();
+          const txt = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index. Must be a positive number.";
-          if (!text) return "No text provided.";
-          if (idx > queue.length + 1) return `Index out of range. Queue has ${queue.length} items.`;
-          const item = makeTextItem(sessionID, text);
-          queue.splice(idx - 1, 0, item);
-          queueBySession.set(sessionID, queue);
+          if (!txt) return "No text provided.";
+          if (idx > s.queue.length + 1) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const item = makeTextItem(sessionID, txt);
+          s.queue.splice(idx - 1, 0, item);
           schedulePersist();
           return `Inserted at position ${idx}: ${item.preview}`;
         }
         case "append": {
-          const text = args.trim();
-          if (!text) return "Usage: /append <text>";
-          const item = makeTextItem(sessionID, text);
-          queue.push(item);
-          queueBySession.set(sessionID, queue);
+          const txt = args.trim();
+          if (!txt) return "Usage: /append <text>";
+          const item = makeTextItem(sessionID, txt);
+          s.queue.push(item);
           schedulePersist();
           return `Appended: ${item.preview}`;
         }
         case "prepend": {
-          const text = args.trim();
-          if (!text) return "Usage: /prepend <text>";
-          const item = makeTextItem(sessionID, text);
-          queue.unshift(item);
-          queueBySession.set(sessionID, queue);
+          const txt = args.trim();
+          if (!txt) return "Usage: /prepend <text>";
+          const item = makeTextItem(sessionID, txt);
+          s.queue.unshift(item);
           schedulePersist();
           showToast(sessionID).catch(() => { });
           return `Prepended: ${item.preview}`;
         }
         case "delete": {
           const idx = parseIndex(args.trim());
-          if (!idx) return "Usage: /delete <index>  (1-based)";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
-          const dropped = queue.splice(idx - 1, 1)[0];
-          queueBySession.set(sessionID, queue);
+          if (!idx) return "Usage: /delete <index> (1-based)";
+          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const dropped = s.queue.splice(idx - 1, 1)[0];
           schedulePersist();
           showToast(sessionID).catch(() => { });
           return `Deleted: ${dropped.preview}`;
@@ -844,39 +850,36 @@ const VALID_SLASH_COMMANDS = [
           const firstSpace = args.indexOf(" ");
           if (firstSpace === -1) return "Usage: /set <index> <text>";
           const idx = parseIndex(args.slice(0, firstSpace));
-          const text = args.slice(firstSpace + 1).trim();
+          const txt = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index.";
-          if (!text) return "No text provided.";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
-          const item = makeTextItem(sessionID, text);
-          queue[idx - 1] = item;
-          queueBySession.set(sessionID, queue);
+          if (!txt) return "No text provided.";
+          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const item = makeTextItem(sessionID, txt);
+          s.queue[idx - 1] = item;
           schedulePersist();
           return `Set position ${idx}: ${item.preview}`;
         }
         case "sort": {
-          queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
-          queueBySession.set(sessionID, queue);
+          s.queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
           schedulePersist();
-          return `Sorted ${queue.length} items by time (oldest first)`;
+          return `Sorted ${s.queue.length} items by time (oldest first)`;
         }
         case "invert": {
-          queue.reverse();
-          queueBySession.set(sessionID, queue);
+          s.queue.reverse();
           schedulePersist();
-          return `Reversed ${queue.length} items`;
+          return `Reversed ${s.queue.length} items`;
         }
         case "get": {
           const idx = parseIndex(args.trim());
-          if (!idx) return "Usage: /get <index>  (1-based)";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
-          const item = queue[idx - 1];
+          if (!idx) return "Usage: /get <index> (1-based)";
+          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
+          const item = s.queue[idx - 1];
           const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
           const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
           const err = item.lastError ? `\nError: ${item.lastError}` : "";
           const textParts = item.parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
           return [
-            `Item ${idx}/${queue.length}  status: ${item.status}  age: ${age}s${retry}${err}`,
+            `Item ${idx}/${s.queue.length} status: ${item.status} age: ${age}s${retry}${err}`,
             `Preview: ${item.preview}`,
             `Content:`,
             textParts || "(no text content)",
@@ -894,7 +897,7 @@ const VALID_SLASH_COMMANDS = [
       "queue-clear": { template: "$ARGUMENTS", description: "Clear the queue" },
       "queue-pause": { template: "$ARGUMENTS", description: "Pause auto-drain" },
       "queue-resume": { template: "$ARGUMENTS", description: "Resume auto-drain" },
-  "queue-cancel": { template: "$ARGUMENTS", description: "Cancel active queue drain" },
+      "queue-cancel": { template: "$ARGUMENTS", description: "Cancel active queue drain" },
       "queue-count": { template: "$ARGUMENTS", description: "Show pending item count" },
       "queue-reorder": { template: "$ARGUMENTS", description: "Reorder: /queue-reorder <from> <to>" },
       "queue-insert": { template: "$ARGUMENTS", description: "Insert: /queue-insert <pos> <text>" },
@@ -922,49 +925,45 @@ const VALID_SLASH_COMMANDS = [
       },
 
       event: async ({ event }: { event: any }) => {
+        const s = getSession(event.properties?.sessionID);
+        if (!s) return;
+
         if (event.type === "session.status") {
           const { sessionID, status } = event.properties;
-          const busy = status.type !== "idle";
-          busyBySession.set(sessionID, busy);
-          if (!busy) {
-            if (cancelledBySession.has(sessionID)) {
-              cancelledBySession.delete(sessionID);
-              activeSubmissionBySession.delete(sessionID);
-              draining.delete(sessionID);
-              return;
-            }
-            const wasQueueOwned = activeSubmissionBySession.has(sessionID);
-            activeSubmissionBySession.delete(sessionID);
-            if (wasQueueOwned && !pausedBySession.has(sessionID)) {
-              await drainOne(sessionID);
-            }
+          const sess = getSession(sessionID);
+          const nowBusy = status.type !== "idle";
+          const wasBusy = sess.modelBusy;
+          sess.modelBusy = nowBusy;
+          if (wasBusy && !nowBusy && sess.queueOwner) {
+            sess.queueOwner = false;
+            tick(sessionID).catch(() => { });
           }
           return;
         }
 
         if (event.type === "session.idle") {
           const { sessionID } = event.properties;
-          busyBySession.set(sessionID, false);
-          if (cancelledBySession.has(sessionID)) {
-            cancelledBySession.delete(sessionID);
-            activeSubmissionBySession.delete(sessionID);
-            draining.delete(sessionID);
-            return;
+          const sess = getSession(sessionID);
+          const wasBusy = sess.modelBusy;
+          sess.modelBusy = false;
+          if (wasBusy && sess.queueOwner) {
+            sess.queueOwner = false;
+            tick(sessionID).catch(() => { });
           }
-          const wasQueueOwned = activeSubmissionBySession.has(sessionID);
-          activeSubmissionBySession.delete(sessionID);
-          if (wasQueueOwned && !pausedBySession.has(sessionID)) {
-            await drainOne(sessionID);
-          }
+          return;
         }
 
         if (event.type === "session.error") {
           const { sessionID, error } = event.properties ?? {};
-          if (sessionID && error?.name === "MessageAbortedError") {
-            cancelledBySession.add(sessionID);
-            activeSubmissionBySession.delete(sessionID);
-            draining.delete(sessionID);
+          if (sessionID) {
+            const sess = getSession(sessionID);
+            if (error?.name === "MessageAbortedError") {
+              sess.cancelled = true;
+              sess.queueOwner = false;
+              sess.modelBusy = false;
+            }
           }
+          return;
         }
       },
 
@@ -988,7 +987,7 @@ const VALID_SLASH_COMMANDS = [
           }
         }
 
-        if (draining.has(input.sessionID)) return;
+        const s = getSession(input.sessionID);
 
         const textParts = parts.filter((p: any) => p.type === "text");
         const allSystemReminders = textParts.every((p: any) =>
@@ -999,20 +998,12 @@ const VALID_SLASH_COMMANDS = [
         const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
         if (allSynthetic) return;
 
-      const busy = isBusy(input.sessionID);
-      const shouldQueue = busy;
-
-      if (!shouldQueue) {
-        markBusy(input.sessionID);
-        const queue = queueBySession.get(input.sessionID) ?? [];
-        if (getPendingCount(queue) > 0 && !pausedBySession.has(input.sessionID)) {
-          drainOne(input.sessionID).catch(() => { });
+        if (!s.modelBusy) {
+          s.modelBusy = true;
+          return;
         }
-        return;
-      }
 
-        const queue = getQueue(input.sessionID);
-        if (queue.length >= maxQueueSize) {
+        if (s.queue.length >= maxQueueSize) {
           try {
             await client.tui.showToast({
               body: {
@@ -1022,8 +1013,8 @@ const VALID_SLASH_COMMANDS = [
                 duration: emptyToastDurationMs * 3,
               },
             });
-          } catch { /* noop */ }
-          const placeholder = makePlaceholder(output.parts, queue.length, `Queue full; dropped.`);
+          } catch { }
+          const placeholder = makePlaceholder(output.parts, s.queue.length, `Queue full; dropped.`);
           if (placeholder) {
             output.parts.length = 0;
             output.parts.push(placeholder);
@@ -1035,7 +1026,7 @@ const VALID_SLASH_COMMANDS = [
         const queuedParts = originalParts.map(toPromptPart).filter((p: any) => p !== null);
         const preview = extractPreview(queuedParts);
 
-        queue.push({
+        s.queue.push({
           sessionID: input.sessionID,
           agent: input.agent ?? output.message.agent,
           model: input.model ?? output.message.model,
@@ -1050,7 +1041,7 @@ const VALID_SLASH_COMMANDS = [
           enqueuedAt: Date.now(),
         });
 
-        const queueSize = getPendingCount(queue);
+        const queueSize = getPendingCount(s.queue);
         const placeholder = makePlaceholder(originalParts, queueSize, placeholderTemplate);
         if (placeholder) {
           output.parts.length = 0;
@@ -1060,7 +1051,7 @@ const VALID_SLASH_COMMANDS = [
         schedulePersist();
         try {
           await showToast(input.sessionID);
-        } catch { /* TUI may not be active */ }
+        } catch { }
       },
     };
   },
