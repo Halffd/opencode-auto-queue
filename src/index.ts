@@ -1354,10 +1354,10 @@ export const AutoQueuePlugin = {
 
         s.queue.push({
           sessionID: input.sessionID,
-          agent: input.agent ?? output.message.agent,
-          model: input.model ?? output.message.model,
-          system: output.message.system,
-          tools: output.message.tools,
+          agent: input.agent ?? output.message?.agent,
+          model: input.model ?? output.message?.model,
+          system: output.message?.system,
+          tools: output.message?.tools,
           messageID: input.messageID,
           variant: input.variant,
           parts: queuedParts,
