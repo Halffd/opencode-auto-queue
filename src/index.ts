@@ -488,6 +488,13 @@ export const AutoQueuePlugin = {
             debugLog(tickLabel, "Calling session.prompt", { sessionID, agent: next.agent, partsCount: next.parts.length });
             await client.session.prompt(promptArgs);
             debugLog(tickLabel, "session.prompt RESOLVED (accepted)", { preview: next.preview });
+            if (s.cancelled) {
+              debugLog(tickLabel, "CANCELLED after prompt resolved, aborting");
+              s.cancelled = false;
+              s.queueOwner = false;
+              next.status = "queued";
+              return;
+            }
             next.status = "sent";
             next.lastError = undefined;
             sent = true;
