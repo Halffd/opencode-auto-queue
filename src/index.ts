@@ -1,4 +1,23 @@
 import { tool } from "@opencode-ai/plugin";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const DEBUG_LOG_PATH = join(tmpdir(), "opencode-auto-queue-debug.log");
+
+function debugLog(source: string, message: string, data?: Record<string, unknown>) {
+  const ts = new Date().toISOString();
+  const dataStr = data ? " " + JSON.stringify(data) : "";
+  const line = `[${ts}] [${source}] ${message}${dataStr}\n`;
+  try {
+    appendFileSync(DEBUG_LOG_PATH, line);
+  } catch {
+    try {
+      mkdirSync(tmpdir(), { recursive: true });
+      appendFileSync(DEBUG_LOG_PATH, line);
+    } catch { }
+  }
+}
 
 interface AutoQueueOptions {
   toastDurationMs?: number;
@@ -92,7 +111,7 @@ async function loadState(filePath: string): Promise<PersistedState | null> {
   }
 }
 
-  function makeTruncate(previewLength: number) {
+function makeTruncate(previewLength: number) {
   return function truncatePreview(text: string): string {
     const len = previewLength;
     const trimmed = text.replace(/\s+/g, " ").trim();
@@ -228,10 +247,23 @@ function makeBuildToastMessage(truncatePreview: (text: string) => string) {
   };
 }
 
+function snapshotState(s: { modelBusy: boolean; queueOwner: boolean; cancelled: boolean; paused: boolean; queue: QueuedItem[] }) {
+  return {
+    modelBusy: s.modelBusy,
+    queueOwner: s.queueOwner,
+    cancelled: s.cancelled,
+    paused: s.paused,
+    queueLen: s.queue.length,
+    queueSummary: s.queue.map((i) => `${i.preview.slice(0, 20)}:${i.status}`),
+  };
+}
+
 export const AutoQueuePlugin = {
   id: "opencode-auto-queue",
   server: async (ctx: any, options: AutoQueueOptions = {}) => {
     const client = ctx.client;
+
+    debugLog("server", "Plugin server starting", { directory: ctx.directory, options });
 
     const {
       toastDurationMs = 86_400_000,
@@ -272,11 +304,16 @@ export const AutoQueuePlugin = {
     let persistTimer: ReturnType<typeof setTimeout> | null = null;
     let persistDirEnsured = false;
 
+    let tickCallCount = 0;
+    let eventCount = 0;
+    let chatMessageCount = 0;
+
     function getSession(sessionID: string) {
       let s = stateBySession.get(sessionID);
       if (!s) {
         s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [] };
         stateBySession.set(sessionID, s);
+        debugLog("getSession", "Created new session state", { sessionID });
       }
       return s;
     }
@@ -302,7 +339,10 @@ export const AutoQueuePlugin = {
           await Bun.write(dir + "/.gitkeep", "").then(() => { persistDirEnsured = true; }).catch(() => { });
         }
         await Bun.write(resolvedPersistPath, JSON.stringify(state));
-      } catch { }
+        debugLog("persistState", "Persisted state", { path: resolvedPersistPath, queueCount: Object.keys(queues).length });
+      } catch (e: any) {
+        debugLog("persistState", "FAILED to persist state", { error: String(e) });
+      }
     }
 
     function schedulePersist() {
@@ -317,7 +357,11 @@ export const AutoQueuePlugin = {
     async function restoreState() {
       if (!persistQueue) return;
       const state = await loadState(resolvedPersistPath);
-      if (!state) return;
+      if (!state) {
+        debugLog("restoreState", "No persisted state found", { path: resolvedPersistPath });
+        return;
+      }
+      debugLog("restoreState", "Loaded persisted state", { path: resolvedPersistPath, mode: state.mode, pausedCount: state.pausedSessions?.length, queueCount: Object.keys(state.queues ?? {}).length });
       if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
       if (state.pausedSessions) {
         for (const sid of state.pausedSessions) getSession(sid).paused = true;
@@ -349,115 +393,179 @@ export const AutoQueuePlugin = {
     }
 
     async function tick(sessionID: string) {
-      if (workerRunning.has(sessionID)) return;
+      const tickId = ++tickCallCount;
+      const tickLabel = `tick#${tickId}`;
+
+      debugLog(tickLabel, "Called", { sessionID, workerRunning: workerRunning.has(sessionID) });
+
+      if (workerRunning.has(sessionID)) {
+        debugLog(tickLabel, "EXIT: worker already running", { sessionID });
+        return;
+      }
       const s = getSession(sessionID);
-      if (s.queue.length === 0) return;
-      if (s.modelBusy) return;
-      if (s.paused) return;
+
+      debugLog(tickLabel, "State at entry", snapshotState(s));
+
+      if (s.queue.length === 0) {
+        debugLog(tickLabel, "EXIT: queue empty");
+        return;
+      }
+      if (s.modelBusy) {
+        debugLog(tickLabel, "EXIT: modelBusy=true");
+        return;
+      }
+      if (s.paused) {
+        debugLog(tickLabel, "EXIT: paused=true");
+        return;
+      }
       if (s.cancelled) {
+        debugLog(tickLabel, "EXIT: cancelled=true, clearing cancelled+queueOwner");
         s.cancelled = false;
         s.queueOwner = false;
         return;
       }
 
-    workerRunning.add(sessionID);
-    try {
-      if (drainDelayMs > 0) await sleep(drainDelayMs);
+      workerRunning.add(sessionID);
+      debugLog(tickLabel, "Worker started", { sessionID });
+      try {
+        if (drainDelayMs > 0) {
+          debugLog(tickLabel, "Sleeping for drainDelay", { drainDelayMs });
+          await sleep(drainDelayMs);
+        }
 
-      const next = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
-      if (!next) return;
-      if (s.modelBusy) return;
-      if (s.paused) return;
-      if (s.cancelled) {
-        s.cancelled = false;
-        s.queueOwner = false;
-        return;
-      }
-
-      next.status = "sending";
-      s.queueOwner = true;
-      schedulePersist();
-      try { await showToast(sessionID); } catch { }
-
-      let sent = false;
-      let attempts = 0;
-      const maxAttempts = maxRetries + 1;
-
-      while (!sent && attempts < maxAttempts) {
-        if (s.cancelled) {
-          s.cancelled = false;
-          s.queueOwner = false;
-          next.status = "queued";
+        const next = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+        if (!next) {
+          debugLog(tickLabel, "EXIT: no queued/failed item found after delay", { queueSummary: s.queue.map((i) => `${i.preview.slice(0, 20)}:${i.status}`) });
           return;
         }
-        attempts++;
-        try {
-          await client.session.prompt({
-            path: { id: sessionID },
-            body: {
-              agent: next.agent,
-              model: next.model,
-              system: next.system,
-              tools: next.tools,
-              parts: markInternalParts(next.parts),
-            },
-          });
-          next.status = "sent";
-          next.lastError = undefined;
-          sent = true;
-          s.modelBusy = true;
-        } catch (error: any) {
-          const errMsg = error instanceof Error ? error.message : String(error);
-          if (isTransientError(error) && attempts < maxAttempts) {
-            next.retries = attempts;
-            next.lastError = errMsg;
-            next.status = "failed";
-            const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
-            try {
-              await client.tui.showToast({
-                body: {
-                  title: "Message Queue",
-                  message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
-                  variant: "warning",
-                  duration: delay + 2000,
-                },
-              });
-            } catch { }
-            await sleep(delay);
+        if (s.modelBusy) {
+          debugLog(tickLabel, "EXIT: modelBusy became true after delay", snapshotState(s));
+          return;
+        }
+        if (s.paused) {
+          debugLog(tickLabel, "EXIT: paused became true after delay");
+          return;
+        }
+        if (s.cancelled) {
+          debugLog(tickLabel, "EXIT: cancelled became true after delay, clearing");
+          s.cancelled = false;
+          s.queueOwner = false;
+          return;
+        }
+
+        debugLog(tickLabel, "Sending item", { preview: next.preview, status: next.status, retries: next.retries });
+        next.status = "sending";
+        s.queueOwner = true;
+        debugLog(tickLabel, "State after marking sending", snapshotState(s));
+        schedulePersist();
+        try { await showToast(sessionID); } catch { }
+
+        let sent = false;
+        let attempts = 0;
+        const maxAttempts = maxRetries + 1;
+
+        while (!sent && attempts < maxAttempts) {
+          if (s.cancelled) {
+            debugLog(tickLabel, "CANCELLED during send loop, aborting", { attempts });
+            s.cancelled = false;
+            s.queueOwner = false;
             next.status = "queued";
-          } else {
-            next.retries = attempts;
-            next.lastError = errMsg;
-            next.status = "failed";
-            try {
-              await client.tui.showToast({
-                body: {
-                  title: "Message Queue",
-                  message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
-                  variant: "error",
-                  duration: toastDurationMs,
-                },
-              });
-            } catch { }
-            break;
+            return;
+          }
+          attempts++;
+          debugLog(tickLabel, "Attempt sending", { attempt: attempts, maxAttempts, preview: next.preview });
+          try {
+            const promptArgs = {
+              path: { id: sessionID },
+              body: {
+                agent: next.agent,
+                model: next.model,
+                system: next.system,
+                tools: next.tools,
+                parts: markInternalParts(next.parts),
+              },
+            };
+            debugLog(tickLabel, "Calling session.prompt", { sessionID, agent: next.agent, partsCount: next.parts.length });
+            await client.session.prompt(promptArgs);
+            debugLog(tickLabel, "session.prompt RESOLVED (accepted)", { preview: next.preview });
+            next.status = "sent";
+            next.lastError = undefined;
+            sent = true;
+            debugLog(tickLabel, "State after prompt accepted", snapshotState(s));
+          } catch (error: any) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            const errName = error?.name ?? "unknown";
+            debugLog(tickLabel, "session.prompt REJECTED", { error: errMsg.slice(0, 200), errorName: errName, isTransient: isTransientError(error), attempt: attempts });
+            if (isTransientError(error) && attempts < maxAttempts) {
+              next.retries = attempts;
+              next.lastError = errMsg;
+              next.status = "failed";
+              const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
+              debugLog(tickLabel, "Transient error, retrying", { delay, attempt: attempts });
+              try {
+                await client.tui.showToast({
+                  body: {
+                    title: "Message Queue",
+                    message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
+                    variant: "warning",
+                    duration: delay + 2000,
+                  },
+                });
+              } catch { }
+              await sleep(delay);
+              next.status = "queued";
+            } else {
+              next.retries = attempts;
+              next.lastError = errMsg;
+              next.status = "failed";
+              debugLog(tickLabel, "Non-transient error or max retries, marking failed", { attempt: attempts, preview: next.preview });
+              try {
+                await client.tui.showToast({
+                  body: {
+                    title: "Message Queue",
+                    message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
+                    variant: "error",
+                    duration: toastDurationMs,
+                  },
+                });
+              } catch { }
+              break;
+            }
           }
         }
-      }
 
-      s.queue = s.queue.filter((item) => item.status !== "sent");
-      schedulePersist();
-      try { await showToast(sessionID); } catch { }
+        const beforeFilter = s.queue.length;
+        s.queue = s.queue.filter((item) => item.status !== "sent");
+        debugLog(tickLabel, "Filtered sent items", { before: beforeFilter, after: s.queue.length, sent });
+        schedulePersist();
+        try { await showToast(sessionID); } catch { }
 
-      if (!sent && next.status === "failed") {
-        const more = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
-        if (more) {
-          s.queueOwner = false;
-          tick(sessionID).catch(() => { });
+        debugLog(tickLabel, "State after send completion", { sent, ...snapshotState(s) });
+
+        if (sent) {
+          s.queueOwner = true;
+          const hasMore = s.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+          if (hasMore) {
+            debugLog(tickLabel, "Item sent successfully, queue has more items, scheduling re-tick (idle may have been consumed during await)", { queueRemaining: s.queue.length });
+            setTimeout(() => tick(sessionID).catch(() => { }), 0);
+          } else {
+            debugLog(tickLabel, "Item sent successfully, queue empty, waiting for idle event if more items arrive", { queueRemaining: s.queue.length, queueOwner: s.queueOwner });
+          }
+        } else if (next.status === "failed") {
+          const more = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+          if (more) {
+            debugLog(tickLabel, "Send failed permanently, but more items in queue, re-ticking", { morePreview: more.preview });
+            s.queueOwner = false;
+            tick(sessionID).catch(() => { });
+          } else {
+            debugLog(tickLabel, "Send failed permanently, no more items to process");
+            s.queueOwner = false;
+          }
         }
+      } finally {
+        workerRunning.delete(sessionID);
+        debugLog(tickLabel, "Worker finished", { sessionID, state: snapshotState(s) });
       }
-    } finally {
-      workerRunning.delete(sessionID);
-    }
     }
 
     function makeTextItem(sessionID: string, text: string): QueuedItem {
@@ -497,6 +605,7 @@ export const AutoQueuePlugin = {
       },
       async execute({ action, index, to, text }: { action?: string; index?: number; to?: number; text?: string }, ctx: any) {
         const nextAction = action ?? "status";
+        debugLog("tool", "Queue tool invoked", { action: nextAction, index, to, textLen: text?.length, sessionID: ctx.sessionID });
         const s = getSession(ctx.sessionID);
         const pendingCount = getPendingCount(s.queue);
         const failedCount = s.queue.filter((i) => i.status === "failed").length;
@@ -732,6 +841,8 @@ export const AutoQueuePlugin = {
       const normalized = normalizeCommandName(cmd);
       if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
 
+      debugLog("slashCmd", "Handling slash command", { cmd, normalized, argsLen: args.length, sessionID });
+
       const s = getSession(sessionID);
       const pendingCount = getPendingCount(s.queue);
       const failedCount = s.queue.filter((i) => i.status === "failed").length;
@@ -910,34 +1021,62 @@ export const AutoQueuePlugin = {
       "queue-get": { template: "$ARGUMENTS", description: "Get: /queue-get <index>" },
     };
 
+    debugLog("server", "Plugin server ready, returning hooks");
+
     return {
       tool: { queue: queueTool },
 
-      config: async (inputConfig: any) => { },
+      config: async (inputConfig: any) => {
+        debugLog("config", "Config hook called", { keys: Object.keys(inputConfig ?? {}) });
+      },
 
       "command.execute.before": async (
         input: { command: string; sessionID: string; arguments: string },
         output: { parts: any[] },
       ) => {
+        debugLog("command.before", "Command intercepted", { command: input.command, sessionID: input.sessionID, argsLen: input.arguments?.length });
         const result = handleSlashCommand(input.command, input.arguments ?? "", input.sessionID);
         if (result === null) return;
         output.parts = markInternalParts([{ type: "text", text: result }]);
       },
 
       event: async ({ event }: { event: any }) => {
+        const eNum = ++eventCount;
+        const eLabel = `event#${eNum}`;
+
+        debugLog(eLabel, "Event received", { type: event.type, sessionID: event.properties?.sessionID, props: Object.keys(event.properties ?? {}) });
+
         const s = getSession(event.properties?.sessionID);
-        if (!s) return;
+        if (!s) {
+          debugLog(eLabel, "EXIT: no session for event properties", { type: event.type });
+          return;
+        }
 
         if (event.type === "session.status") {
           const { sessionID, status } = event.properties;
           const sess = getSession(sessionID);
           const nowBusy = status.type !== "idle";
           const wasBusy = sess.modelBusy;
+
+          debugLog(eLabel, "session.status", { sessionID, statusType: status.type, nowBusy, wasBusy, queueOwnerBefore: sess.queueOwner, queueLen: sess.queue.length });
+
           sess.modelBusy = nowBusy;
-          if (wasBusy && !nowBusy && sess.queueOwner) {
-            sess.queueOwner = false;
-            tick(sessionID).catch(() => { });
+
+      if (wasBusy && !nowBusy) {
+        const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+        if (hasQueued) {
+          debugLog(eLabel, "session.status: busy->idle AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
+          sess.queueOwner = false;
+          sess.cancelled = false;
+          tick(sessionID).catch(() => { });
+        } else {
+              debugLog(eLabel, "session.status: busy->idle, no queued items to drain", { sessionID });
+            }
+          } else {
+            debugLog(eLabel, "session.status: no idle transition, no action", { sessionID, wasBusy, nowBusy });
           }
+
+          debugLog(eLabel, "session.status: state after", snapshotState(sess));
           return;
         }
 
@@ -945,31 +1084,65 @@ export const AutoQueuePlugin = {
           const { sessionID } = event.properties;
           const sess = getSession(sessionID);
           const wasBusy = sess.modelBusy;
+
+          debugLog(eLabel, "session.idle", { sessionID, wasBusy, queueOwnerBefore: sess.queueOwner, queueLen: sess.queue.length });
+
           sess.modelBusy = false;
-          if (wasBusy && sess.queueOwner) {
-            sess.queueOwner = false;
-            tick(sessionID).catch(() => { });
+
+          if (wasBusy) {
+            const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+      if (hasQueued) {
+          debugLog(eLabel, "session.idle: was busy AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
+          sess.queueOwner = false;
+          sess.cancelled = false;
+          tick(sessionID).catch(() => { });
+            } else {
+              debugLog(eLabel, "session.idle: was busy, no queued items to drain", { sessionID });
+            }
+          } else {
+            debugLog(eLabel, "session.idle: was NOT busy, ignoring (duplicate idle?)", { sessionID });
           }
+
+          debugLog(eLabel, "session.idle: state after", snapshotState(sess));
           return;
         }
 
         if (event.type === "session.error") {
           const { sessionID, error } = event.properties ?? {};
+          debugLog(eLabel, "session.error", { sessionID, errorName: error?.name, errorMsg: error?.message?.slice(0, 200) });
           if (sessionID) {
             const sess = getSession(sessionID);
+            debugLog(eLabel, "session.error: state before", snapshotState(sess));
             if (error?.name === "MessageAbortedError") {
+              debugLog(eLabel, "session.error: MessageAbortedError detected, setting cancelled=true", { sessionID });
               sess.cancelled = true;
               sess.queueOwner = false;
               sess.modelBusy = false;
+            } else {
+              debugLog(eLabel, "session.error: non-abort error, not modifying state", { sessionID, errorName: error?.name });
             }
+            debugLog(eLabel, "session.error: state after", snapshotState(sess));
           }
           return;
         }
+
+        debugLog(eLabel, "Unhandled event type", { type: event.type });
       },
 
       "chat.message": async (input: any, output: any) => {
-        if (currentMode !== "hold") return;
-        if (isInternalMessage(output.parts)) return;
+        const cmNum = ++chatMessageCount;
+        const cmLabel = `chatMsg#${cmNum}`;
+
+        debugLog(cmLabel, "chat.message called", { sessionID: input.sessionID, mode: currentMode, partsCount: output.parts?.length });
+
+        if (currentMode !== "hold") {
+          debugLog(cmLabel, "EXIT: not in hold mode", { mode: currentMode });
+          return;
+        }
+        if (isInternalMessage(output.parts)) {
+          debugLog(cmLabel, "EXIT: internal message, ignoring");
+          return;
+        }
 
         const parts = output.parts ?? [];
         const firstText = parts.find((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
@@ -978,10 +1151,12 @@ export const AutoQueuePlugin = {
           if (trimmed.startsWith("/queue-") || trimmed.startsWith("/queue ")) {
             const cmdName = trimmed.replace(/^\//, "").split(/\s+/)[0];
             const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
+            debugLog(cmLabel, "Detected queue slash command in chat", { cmdName, cmdArgs });
             const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
             if (result !== null) {
               output.parts.length = 0;
               output.parts.push(...markInternalParts([{ type: "text", text: result }]));
+              debugLog(cmLabel, "Replaced message with command result");
               return;
             }
           }
@@ -993,17 +1168,30 @@ export const AutoQueuePlugin = {
         const allSystemReminders = textParts.every((p: any) =>
           typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
         );
-        if (allSystemReminders) return;
-
-        const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
-        if (allSynthetic) return;
-
-        if (!s.modelBusy) {
-          s.modelBusy = true;
+        if (allSystemReminders) {
+          debugLog(cmLabel, "EXIT: all parts are system reminders");
           return;
         }
 
+        const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
+        if (allSynthetic) {
+          debugLog(cmLabel, "EXIT: all parts are synthetic/ignored");
+          return;
+        }
+
+        debugLog(cmLabel, "State before queue decision", { modelBusy: s.modelBusy, queueLen: s.queue.length, queueOwner: s.queueOwner });
+
+        if (!s.modelBusy) {
+          debugLog(cmLabel, "Model NOT busy → letting message through (setting modelBusy=true)", { sessionID: input.sessionID });
+          s.modelBusy = true;
+          debugLog(cmLabel, "State after let-through", snapshotState(s));
+          return;
+        }
+
+        debugLog(cmLabel, "Model IS busy → queuing message", { sessionID: input.sessionID, queueLenBefore: s.queue.length });
+
         if (s.queue.length >= maxQueueSize) {
+          debugLog(cmLabel, "Queue FULL, dropping message", { maxQueueSize });
           try {
             await client.tui.showToast({
               body: {
@@ -1047,6 +1235,8 @@ export const AutoQueuePlugin = {
           output.parts.length = 0;
           output.parts.push(placeholder);
         }
+
+        debugLog(cmLabel, "Message enqueued", { preview, queueSize, queueLenAfter: s.queue.length, state: snapshotState(s) });
 
         schedulePersist();
         try {
