@@ -348,7 +348,9 @@ export const AutoQueuePlugin = {
         pausedSessions,
       };
       try {
-        await Bun.write(resolvedPersistPath, JSON.stringify(state));
+        const raw = JSON.stringify(state);
+        await Bun.write(resolvedPersistPath, raw);
+        lastPersistedRaw = raw;
         debugLog("persistState", "Persisted state", { path: resolvedPersistPath, queueCount: Object.keys(queues).length });
       } catch (e: any) {
         debugLog("persistState", "FAILED to persist state", { error: String(e) });
@@ -372,14 +374,23 @@ export const AutoQueuePlugin = {
         return;
       }
       debugLog("restoreState", "Loaded persisted state", { path: resolvedPersistPath, mode: state.mode, pausedCount: state.pausedSessions?.length, queueCount: Object.keys(state.queues ?? {}).length });
+      await applyLoadedState(state);
+    }
+
+    let lastPersistedRaw = "";
+
+    async function applyLoadedState(state: PersistedState) {
       if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
       if (state.pausedSessions) {
         for (const sid of state.pausedSessions) getSession(sid).paused = true;
       }
       if (state.queues) {
         for (const [sessionID, items] of Object.entries(state.queues)) {
-          const queue = deserializeQueue(items);
-          if (queue.length > 0) getSession(sessionID).queue = queue;
+          if (workerRunning.has(sessionID)) {
+            debugLog("applyLoadedState", "SKIP session: worker running, avoiding clobber", { sessionID });
+            continue;
+          }
+          getSession(sessionID).queue = deserializeQueue(items);
         }
       }
     }
@@ -387,23 +398,33 @@ export const AutoQueuePlugin = {
     await restoreState();
 
     if (persistQueue) {
-      const watcher = Bun.watch([resolvedPersistPath], { recursive: false });
-      for await (const event of watcher) {
-        debugLog("fileWatcher", "Queue file changed, reloading state", { path: resolvedPersistPath, event: event.type });
-        const state = await loadState(resolvedPersistPath);
-        if (!state) continue;
-        if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
-        if (state.pausedSessions) {
-          for (const sid of state.pausedSessions) getSession(sid).paused = true;
-        }
-        if (state.queues) {
-          for (const [sessionID, items] of Object.entries(state.queues)) {
-            const queue = deserializeQueue(items);
-            getSession(sessionID).queue = queue;
+      (async () => {
+        try {
+          const watchDir = resolvedPersistPath.substring(0, resolvedPersistPath.lastIndexOf("/")) || ".";
+          const baseName = resolvedPersistPath.substring(resolvedPersistPath.lastIndexOf("/") + 1);
+          const watcher = Bun.watch(watchDir, { recursive: false });
+          debugLog("fileWatcher", "Watching directory for queue file changes", { watchDir, baseName });
+          for await (const event of watcher) {
+            const changedName = (event as any).fileName;
+            if (changedName && changedName !== baseName) continue;
+            try {
+              const file = Bun.file(resolvedPersistPath);
+              if (!(await file.exists())) continue;
+              const raw = await file.text();
+              if (raw === lastPersistedRaw) continue;
+              const data = JSON.parse(raw);
+              if (!data || data.version !== 1) continue;
+              debugLog("fileWatcher", "External queue change detected, reloading", { event: event.type });
+              await applyLoadedState(data as PersistedState);
+              debugLog("fileWatcher", "State reloaded", { mode: data.mode, queueCount: Object.keys(data.queues ?? {}).length });
+            } catch (e: any) {
+              debugLog("fileWatcher", "Failed to process change", { error: String(e?.message ?? e) });
+            }
           }
+        } catch (e: any) {
+          debugLog("fileWatcher", "Watcher stopped", { error: String(e?.message ?? e) });
         }
-        debugLog("fileWatcher", "State reloaded from file", { queueCount: Object.keys(state.queues ?? {}).length });
-      }
+      })();
     }
 
     async function showToast(sessionID: string, forceEmpty = false) {
