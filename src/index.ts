@@ -266,7 +266,7 @@ export const AutoQueuePlugin = {
     debugLog("server", "Plugin server starting", { directory: ctx.directory, options });
 
     const {
-      toastDurationMs = 86_400_000,
+      toastDurationMs = 10_000,
       emptyToastDurationMs = 4_000,
       maxPreviews = 3,
       previewLength = 28,
@@ -1243,23 +1243,24 @@ export const AutoQueuePlugin = {
           return;
         }
 
-        debugLog(eLabel, "Unhandled event type", { type: event.type });
-      },
-
-      "message.updated": async ({ event }: { event: any }) => {
-        const { sessionID, message } = event.properties ?? {};
-        if (!sessionID || !message) return;
-        const s = getSession(sessionID);
-        if (message.role === "assistant" && message.parts) {
-          const text = message.parts
-            .filter((p: any) => p.type === "text" && typeof p.text === "string")
-            .map((p: any) => p.text)
-            .join("\n");
-          if (text.trim()) {
-            s.lastAssistantResponse = text;
-            debugLog("message.updated", "Captured assistant response", { sessionID, preview: text.slice(0, 120), looksComplete: looksComplete(text) });
+        if (event.type === "message.updated") {
+          const info = event.properties?.info;
+          const sid = event.properties?.sessionID;
+          if (sid && info?.role === "assistant") {
+            const text = (info.parts ?? [])
+              .filter((p: any) => p.type === "text" && typeof p.text === "string")
+              .map((p: any) => p.text)
+              .join("\n");
+            if (text.trim()) {
+              const sess = getSession(sid);
+              sess.lastAssistantResponse = text;
+              debugLog(eLabel, "Captured assistant response", { sessionID: sid, len: text.length, looksComplete: looksComplete(text) });
+            }
           }
+          return;
         }
+
+        debugLog(eLabel, "Unhandled event type", { type: event.type });
       },
 
       "chat.message": async (input: any, output: any) => {
@@ -1317,6 +1318,10 @@ export const AutoQueuePlugin = {
         if (!s.modelBusy) {
           debugLog(cmLabel, "Model NOT busy → letting message through (setting modelBusy=true)", { sessionID: input.sessionID });
           s.modelBusy = true;
+          if (s.cancelled) {
+            debugLog(cmLabel, "Clearing stale cancelled flag (fresh user message)", { sessionID: input.sessionID });
+            s.cancelled = false;
+          }
           debugLog(cmLabel, "State after let-through", snapshotState(s));
           return;
         }
