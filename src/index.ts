@@ -287,7 +287,7 @@ export const AutoQueuePlugin = {
     const extractPreview = makeExtractPreview(truncatePreview);
     const buildToastMessage = makeBuildToastMessage(truncatePreview);
 
-    const resolvedPersistPath = persistPath || `${ctx.directory}/.opencode/queue-state.json`;
+    const resolvedPersistPath = persistPath || `${ctx.directory}/.git/queue.json`;
 
     let currentMode: string = defaultMode;
 
@@ -302,7 +302,6 @@ export const AutoQueuePlugin = {
     const workerRunning = new Set<string>();
 
     let persistTimer: ReturnType<typeof setTimeout> | null = null;
-    let persistDirEnsured = false;
 
     let tickCallCount = 0;
     let eventCount = 0;
@@ -334,10 +333,6 @@ export const AutoQueuePlugin = {
         pausedSessions,
       };
       try {
-        if (!persistDirEnsured) {
-          const dir = resolvedPersistPath.substring(0, resolvedPersistPath.lastIndexOf("/"));
-          await Bun.write(dir + "/.gitkeep", "").then(() => { persistDirEnsured = true; }).catch(() => { });
-        }
         await Bun.write(resolvedPersistPath, JSON.stringify(state));
         debugLog("persistState", "Persisted state", { path: resolvedPersistPath, queueCount: Object.keys(queues).length });
       } catch (e: any) {
@@ -375,6 +370,26 @@ export const AutoQueuePlugin = {
     }
 
     await restoreState();
+
+    if (persistQueue) {
+      const watcher = Bun.watch([resolvedPersistPath], { recursive: false });
+      for await (const event of watcher) {
+        debugLog("fileWatcher", "Queue file changed, reloading state", { path: resolvedPersistPath, event: event.type });
+        const state = await loadState(resolvedPersistPath);
+        if (!state) continue;
+        if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
+        if (state.pausedSessions) {
+          for (const sid of state.pausedSessions) getSession(sid).paused = true;
+        }
+        if (state.queues) {
+          for (const [sessionID, items] of Object.entries(state.queues)) {
+            const queue = deserializeQueue(items);
+            getSession(sessionID).queue = queue;
+          }
+        }
+        debugLog("fileWatcher", "State reloaded from file", { queueCount: Object.keys(state.queues ?? {}).length });
+      }
+    }
 
     async function showToast(sessionID: string, forceEmpty = false) {
       const s = getSession(sessionID);
