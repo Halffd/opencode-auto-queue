@@ -298,6 +298,7 @@ export const AutoQueuePlugin = {
       paused: boolean;
       queue: QueuedItem[];
       lastAssistantResponse: string;
+      modelWorking: boolean;
     }>();
 
     const workerRunning = new Set<string>();
@@ -325,7 +326,7 @@ export const AutoQueuePlugin = {
     function getSession(sessionID: string) {
       let s = stateBySession.get(sessionID);
       if (!s) {
-        s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [], lastAssistantResponse: "" };
+        s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [], lastAssistantResponse: "", modelWorking: false };
         stateBySession.set(sessionID, s);
         debugLog("getSession", "Created new session state", { sessionID });
       }
@@ -490,7 +491,7 @@ export const AutoQueuePlugin = {
           return;
         }
 
-        if (s.lastAssistantResponse && looksComplete(s.lastAssistantResponse)) {
+        if (!s.modelWorking && s.lastAssistantResponse && looksComplete(s.lastAssistantResponse)) {
           const continueCount = s.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
           if (continueCount > 0) {
             debugLog(tickLabel, "COMPLETION DETECTED: last response indicates task complete, pausing queue instead of draining continues", { continueCount, lastResponse: s.lastAssistantResponse.slice(0, 200) });
@@ -1144,7 +1145,7 @@ export const AutoQueuePlugin = {
       if (wasBusy && !nowBusy) {
         const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
         if (hasQueued) {
-          if (sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
+          if (!sess.modelWorking && sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
             const continueCount = sess.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
             if (continueCount > 0) {
               debugLog(eLabel, "COMPLETION DETECTED: last response indicates task complete, NOT auto-draining continues", { sessionID, continueCount, lastResponse: sess.lastAssistantResponse.slice(0, 200) });
@@ -1190,7 +1191,7 @@ export const AutoQueuePlugin = {
           if (wasBusy) {
             const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
             if (hasQueued) {
-              if (sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
+              if (!sess.modelWorking && sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
                 const continueCount = sess.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
                 if (continueCount > 0) {
                   debugLog(eLabel, "COMPLETION DETECTED: last response indicates task complete, NOT auto-draining continues", { sessionID, continueCount, lastResponse: sess.lastAssistantResponse.slice(0, 200) });
@@ -1247,14 +1248,23 @@ export const AutoQueuePlugin = {
           const info = event.properties?.info;
           const sid = event.properties?.sessionID;
           if (sid && info?.role === "assistant") {
-            const text = (info.parts ?? [])
+            const parts = info.parts ?? [];
+            const hasNonTextParts = parts.some((p: any) => p.type !== "text" && p.type !== "thinking");
+            const text = parts
               .filter((p: any) => p.type === "text" && typeof p.text === "string")
               .map((p: any) => p.text)
               .join("\n");
-            if (text.trim()) {
-              const sess = getSession(sid);
+            const sess = getSession(sid);
+            if (hasNonTextParts) {
+              // Model is still working (tool calls, agent invocations, etc.)
+              sess.lastAssistantResponse = "";
+              sess.modelWorking = true;
+              debugLog(eLabel, "Assistant working (non-text parts)", { sessionID: sid, partTypes: parts.map((p: any) => p.type) });
+            } else if (text.trim()) {
+              // Pure text response - likely final
               sess.lastAssistantResponse = text;
-              debugLog(eLabel, "Captured assistant response", { sessionID: sid, len: text.length, looksComplete: looksComplete(text) });
+              sess.modelWorking = false;
+              debugLog(eLabel, "Captured assistant text response", { sessionID: sid, len: text.length, looksComplete: looksComplete(text) });
             }
           }
           return;
