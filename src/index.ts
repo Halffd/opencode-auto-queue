@@ -297,6 +297,7 @@ export const AutoQueuePlugin = {
       cancelled: boolean;
       paused: boolean;
       queue: QueuedItem[];
+      lastAssistantResponse: string;
     }>();
 
     const workerRunning = new Set<string>();
@@ -307,10 +308,24 @@ export const AutoQueuePlugin = {
     let eventCount = 0;
     let chatMessageCount = 0;
 
+    const COMPLETION_PATTERNS = [
+      /all (tasks?|objectives?) (are )?complete/i,
+      /nothing (remaining|more|left) to do/i,
+      /all tests? pass.*nothing remaining/i,
+      /task (is |has been )?complete/i,
+      /work (is |has been )?complete/i,
+      /done\.? (no|nothing) (more|else) (to do|needed)/i,
+      /that (completes|finishes|wraps up) (it|this|everything)/i,
+    ];
+
+    function looksComplete(text: string): boolean {
+      return COMPLETION_PATTERNS.some((re) => re.test(text));
+    }
+
     function getSession(sessionID: string) {
       let s = stateBySession.get(sessionID);
       if (!s) {
-        s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [] };
+        s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [], lastAssistantResponse: "" };
         stateBySession.set(sessionID, s);
         debugLog("getSession", "Created new session state", { sessionID });
       }
@@ -453,6 +468,27 @@ export const AutoQueuePlugin = {
           debugLog(tickLabel, "EXIT: no queued/failed item found after delay", { queueSummary: s.queue.map((i) => `${i.preview.slice(0, 20)}:${i.status}`) });
           return;
         }
+
+        if (s.lastAssistantResponse && looksComplete(s.lastAssistantResponse)) {
+          const continueCount = s.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
+          if (continueCount > 0) {
+            debugLog(tickLabel, "COMPLETION DETECTED: last response indicates task complete, pausing queue instead of draining continues", { continueCount, lastResponse: s.lastAssistantResponse.slice(0, 200) });
+            s.paused = true;
+            try {
+              await client.tui.showToast({
+                body: {
+                  title: "Message Queue",
+                  message: `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
+                  variant: "warning",
+                  duration: 10000,
+                },
+              });
+            } catch { }
+            schedulePersist();
+            return;
+          }
+        }
+
         if (s.modelBusy) {
           debugLog(tickLabel, "EXIT: modelBusy became true after delay", snapshotState(s));
           return;
@@ -1087,16 +1123,35 @@ export const AutoQueuePlugin = {
       if (wasBusy && !nowBusy) {
         const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
         if (hasQueued) {
-          debugLog(eLabel, "session.status: busy->idle AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
-          sess.queueOwner = false;
-          sess.cancelled = false;
-          tick(sessionID).catch(() => { });
-        } else {
-              debugLog(eLabel, "session.status: busy->idle, no queued items to drain", { sessionID });
+          if (sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
+            const continueCount = sess.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
+            if (continueCount > 0) {
+              debugLog(eLabel, "COMPLETION DETECTED: last response indicates task complete, NOT auto-draining continues", { sessionID, continueCount, lastResponse: sess.lastAssistantResponse.slice(0, 200) });
+              sess.paused = true;
+              try {
+                await client.tui.showToast({
+                  body: {
+                    title: "Message Queue",
+                    message: `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
+                    variant: "warning",
+                    duration: 10000,
+                  },
+                });
+              } catch { }
+              schedulePersist();
             }
           } else {
-            debugLog(eLabel, "session.status: no idle transition, no action", { sessionID, wasBusy, nowBusy });
+            debugLog(eLabel, "session.status: busy->idle AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
+            sess.queueOwner = false;
+            sess.cancelled = false;
+            tick(sessionID).catch(() => { });
           }
+        } else {
+          debugLog(eLabel, "session.status: busy->idle, no queued items to drain", { sessionID });
+        }
+      } else {
+        debugLog(eLabel, "session.status: no idle transition, no action", { sessionID, wasBusy, nowBusy });
+      }
 
           debugLog(eLabel, "session.status: state after", snapshotState(sess));
           return;
@@ -1113,11 +1168,30 @@ export const AutoQueuePlugin = {
 
           if (wasBusy) {
             const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
-      if (hasQueued) {
-          debugLog(eLabel, "session.idle: was busy AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
-          sess.queueOwner = false;
-          sess.cancelled = false;
-          tick(sessionID).catch(() => { });
+            if (hasQueued) {
+              if (sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
+                const continueCount = sess.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
+                if (continueCount > 0) {
+                  debugLog(eLabel, "COMPLETION DETECTED: last response indicates task complete, NOT auto-draining continues", { sessionID, continueCount, lastResponse: sess.lastAssistantResponse.slice(0, 200) });
+                  sess.paused = true;
+                  try {
+                    await client.tui.showToast({
+                      body: {
+                        title: "Message Queue",
+                        message: `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
+                        variant: "warning",
+                        duration: 10000,
+                      },
+                    });
+                  } catch { }
+                  schedulePersist();
+                }
+              } else {
+                debugLog(eLabel, "session.idle: was busy AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
+                sess.queueOwner = false;
+                sess.cancelled = false;
+                tick(sessionID).catch(() => { });
+              }
             } else {
               debugLog(eLabel, "session.idle: was busy, no queued items to drain", { sessionID });
             }
@@ -1149,6 +1223,22 @@ export const AutoQueuePlugin = {
         }
 
         debugLog(eLabel, "Unhandled event type", { type: event.type });
+      },
+
+      "message.updated": async ({ event }: { event: any }) => {
+        const { sessionID, message } = event.properties ?? {};
+        if (!sessionID || !message) return;
+        const s = getSession(sessionID);
+        if (message.role === "assistant" && message.parts) {
+          const text = message.parts
+            .filter((p: any) => p.type === "text" && typeof p.text === "string")
+            .map((p: any) => p.text)
+            .join("\n");
+          if (text.trim()) {
+            s.lastAssistantResponse = text;
+            debugLog("message.updated", "Captured assistant response", { sessionID, preview: text.slice(0, 120), looksComplete: looksComplete(text) });
+          }
+        }
       },
 
       "chat.message": async (input: any, output: any) => {
