@@ -251,7 +251,7 @@ export const AutoQueuePlugin = {
       maxPreviews = 3,
       previewLength = 28,
       placeholderTemplate = "Queued; {count} pending",
-      defaultMode = "hold",
+      defaultMode = "immediate",
       maxRetries = 5,
       retryBaseDelayMs = 2_000,
       retryMaxDelayMs = 30_000,
@@ -311,7 +311,8 @@ export const AutoQueuePlugin = {
       if (!persistQueue) return;
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
-      if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
+      // Mode is runtime-only: the configured default wins on startup. A stale
+      // persisted "hold" must not disable auto-drain after an upgrade.
       if (state.pausedSessions) {
         for (const s of state.pausedSessions) pausedBySession.add(s);
       }
@@ -326,9 +327,7 @@ export const AutoQueuePlugin = {
     async function reloadFromDisk() {
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
-      if (state.mode === "hold" || state.mode === "immediate") {
-        currentMode = state.mode;
-      }
+      // Mode is runtime-only (see restoreState).
       pausedBySession.clear();
       if (state.pausedSessions) {
         for (const s of state.pausedSessions) pausedBySession.add(s);
@@ -449,7 +448,7 @@ export const AutoQueuePlugin = {
           next.retries = attempts;
           next.lastError = errMsg;
           next.status = "failed";
-          const delay = BackoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
+          const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
           try {
             await client.tui.showToast({
               body: {
@@ -778,6 +777,13 @@ export const AutoQueuePlugin = {
       return Number.isFinite(n) && n > 0 ? n : null;
     }
 
+    const COMMAND_ALIASES: Record<string, string> = {
+      list: "status",
+      ls: "status",
+      drop: "delete",
+      rm: "delete",
+    };
+
     function normalizeCommandName(cmd: string): string {
       let name = cmd.replace(/^\//, "").toLowerCase();
       if (name.startsWith("queue-")) name = name.slice("queue-".length);
@@ -785,7 +791,17 @@ export const AutoQueuePlugin = {
     }
 
     function handleSlashCommand(cmd: string, args: string, sessionID: string): string | null {
-      const normalized = normalizeCommandName(cmd);
+      let normalized = normalizeCommandName(cmd);
+      if (normalized === "queue") {
+        // Registered "/queue" command (or typed "/queue ..."): run the
+        // sub-action directly in the plugin so it works while the session is
+        // busy instead of being queued as an agent prompt.
+        const trimmed = (args ?? "").trim();
+        const first = trimmed.split(/\s+/)[0]?.toLowerCase() ?? "";
+        if (!first) return null; // bare /queue -> agent-mediated via queue tool
+        normalized = COMMAND_ALIASES[first] ?? first;
+        args = trimmed.slice(first.length).trim();
+      }
       if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
 
       const queue = queueBySession.get(sessionID) ?? [];
