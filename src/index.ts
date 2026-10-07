@@ -1,5 +1,15 @@
-import { tool } from "@opencode-ai/plugin";
-import { appendFileSync, mkdirSync } from "node:fs";
+// opencode-auto-queue — OpenCode V2 server plugin.
+//
+// Holds user prompts in a per-session queue while the model is busy and drains
+// them one at a time on idle. Supports hold/immediate modes, pause/resume,
+// reorder/insert/delete, retry with backoff, completion detection, persistence
+// to .git/queue.json (compatible with the external q.py CLI), and a queue
+// management tool plus queue-* commands.
+//
+// V2 plugin API: default-export a definition with an id and setup(ctx).
+
+import { Plugin } from "@opencode/plugin";
+import { appendFileSync, mkdirSync, statSync, watch as fsWatch } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,11 +30,8 @@ function debugLog(source: string, message: string, data?: Record<string, unknown
 }
 
 interface AutoQueueOptions {
-  toastDurationMs?: number;
-  emptyToastDurationMs?: number;
   maxPreviews?: number;
   previewLength?: number;
-  placeholderTemplate?: string;
   defaultMode?: "hold" | "immediate";
   maxRetries?: number;
   retryBaseDelayMs?: number;
@@ -37,19 +44,26 @@ interface AutoQueueOptions {
   persistDebounceMs?: number;
 }
 
-const INTERNAL_KEY = "__auto_queue_internal";
-
 interface QueuedItem {
   sessionID: string;
-  agent?: string;
-  model?: { providerID: string; modelID: string };
-  system?: string;
-  tools?: string[];
-  messageID?: string;
-  variant?: string;
-  parts: any[];
+  text: string;
+  files?: { uri: string; name?: string; description?: string }[];
+  agents?: string[];
   preview: string;
   status: "queued" | "sending" | "sent" | "failed";
+  retries: number;
+  lastError?: string;
+  enqueuedAt: number;
+}
+
+// Persisted item shape (q.py compatible): parts array instead of plain text.
+interface PersistedItem {
+  sessionID: string;
+  parts: { type: string; text?: string }[];
+  files?: QueuedItem["files"];
+  agents?: string[];
+  preview: string;
+  status: string;
   retries: number;
   lastError?: string;
   enqueuedAt: number;
@@ -58,44 +72,40 @@ interface QueuedItem {
 interface PersistedState {
   version: number;
   mode: string;
-  queues: Record<string, QueuedItem[]>;
+  queues: Record<string, PersistedItem[]>;
   pausedSessions: string[];
 }
 
-function serializeQueue(queue: QueuedItem[]): any[] {
-  return queue.filter((i) => i.status !== "sent").map((item) => ({
+function serializeItem(item: QueuedItem): PersistedItem {
+  return {
     sessionID: item.sessionID,
-    agent: item.agent,
-    model: item.model,
-    system: item.system,
-    tools: item.tools,
-    messageID: item.messageID,
-    variant: item.variant,
-    parts: item.parts,
+    parts: [{ type: "text", text: item.text }],
+    files: item.files,
+    agents: item.agents,
     preview: item.preview,
     status: item.status === "sending" ? "queued" : item.status,
     retries: item.retries,
     lastError: item.lastError,
     enqueuedAt: item.enqueuedAt,
-  }));
+  };
 }
 
-function deserializeQueue(items: any[]): QueuedItem[] {
-  return items.map((item) => ({
+function deserializeItem(item: PersistedItem): QueuedItem {
+  const text = (item.parts ?? [])
+    .filter((p) => p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("\n");
+  return {
     sessionID: item.sessionID ?? "",
-    agent: item.agent,
-    model: item.model,
-    system: item.system,
-    tools: item.tools,
-    messageID: item.messageID,
-    variant: item.variant,
-    parts: item.parts ?? [],
+    text,
+    files: item.files,
+    agents: item.agents,
     preview: item.preview ?? "[restored]",
-    status: (item.status === "queued" || item.status === "failed") ? item.status : "queued",
+    status: item.status === "failed" ? "failed" : "queued",
     retries: item.retries ?? 0,
     lastError: item.lastError,
     enqueuedAt: item.enqueuedAt ?? Date.now(),
-  }));
+  };
 }
 
 async function loadState(filePath: string): Promise<PersistedState | null> {
@@ -120,61 +130,9 @@ function makeTruncate(previewLength: number) {
   };
 }
 
-function makeExtractPreview(truncatePreview: (text: string) => string) {
-  return function extractPreview(parts: any[]): string {
-    const text = parts.find((p: any) => p.type === "text");
-    if (text && "text" in text) return truncatePreview(text.text);
-    if (parts.some((p: any) => p.type === "file")) return "[file]";
-    if (parts.some((p: any) => p.type === "agent")) return "[agent]";
-    if (parts.some((p: any) => p.type === "subtask")) return "[subtask]";
-    return "[message]";
-  };
-}
-
-function toPromptPart(part: any): any {
-  switch (part.type) {
-    case "text":
-      return { type: "text", text: part.text };
-    case "file":
-      return { type: "file", url: part.url, mime: part.mime, filename: part.filename, source: part.source };
-    case "agent":
-      return { type: "agent", name: part.name, source: part.source };
-    case "subtask":
-      return { type: "subtask", prompt: part.prompt, description: part.description, agent: part.agent };
-    default:
-      return null;
-  }
-}
-
-function makePlaceholder(parts: any[], count: number, template: string): any {
-  const tmpl = parts.find((p: any) => p.type === "text") ?? parts[0];
-  if (!tmpl) return null;
-  return {
-    id: tmpl.id,
-    sessionID: tmpl.sessionID,
-    messageID: tmpl.messageID,
-    type: "text",
-    text: template.replace("{count}", String(count)),
-    synthetic: true,
-    ignored: true,
-  };
-}
-
-function isInternalMessage(parts: any[]): boolean {
-  return parts.some((p: any) => p.type === "text" && Boolean(p.metadata?.[INTERNAL_KEY]));
-}
-
-function markInternalParts(parts: any[]): any[] {
-  let hasText = false;
-  const marked = parts.map((part: any) => {
-    if (part.type !== "text") return part;
-    hasText = true;
-    const existing = part.metadata ?? {};
-    return { ...part, metadata: { ...existing, [INTERNAL_KEY]: true } };
-  });
-  if (hasText) return marked;
-  const markerPart = { type: "text", text: "", synthetic: true, ignored: true, metadata: { [INTERNAL_KEY]: true } };
-  return [markerPart, ...marked];
+function extractPreview(text: string, truncatePreview: (t: string) => string): string {
+  if (!text.trim()) return "[message]";
+  return truncatePreview(text);
 }
 
 function getPendingCount(queue: QueuedItem[]): number {
@@ -220,30 +178,39 @@ function sleep(ms: number): Promise<void> {
 
 function backoffDelay(attempt: number, base: number, max: number): number {
   const jitter = Math.random() * base * 0.5;
-  const delay = Math.min(base * Math.pow(2, attempt) + jitter, max);
-  return delay;
+  return Math.min(base * Math.pow(2, attempt) + jitter, max);
 }
 
-function makeBuildToastMessage(truncatePreview: (text: string) => string) {
-  return function buildToastMessage(queue: QueuedItem[], maxPreviews: number): string {
-    const pendingCount = getPendingCount(queue);
-    const failedCount = queue.filter((i) => i.status === "failed").length;
-    const previewCount = Math.min(queue.length, maxPreviews);
-    const previews = queue.slice(0, previewCount).map((item, index) => {
-      const text = truncatePreview(item.preview);
-      if (item.status === "sent") return ` ${index + 1}. [x] ~~${text}~~`;
-      if (item.status === "sending") return ` ${index + 1}. [>] ${text}`;
-      if (item.status === "failed") return ` ${index + 1}. [!] ${text} (${item.retries} retries)`;
-      return ` ${index + 1}. [ ] ${text}`;
-    });
-    const current = queue.find((item) => item.status === "sending")?.preview;
-    const currentLine = current ? `Current: ${truncatePreview(current)}\n` : "";
-    const more = queue.length > previewCount ? `\n +${queue.length - previewCount} more` : "";
-    const failedLine = failedCount > 0 ? ` (${failedCount} failed, will retry)` : "";
-    const header = `Queue (${pendingCount} pending${failedLine})`;
-    const rule = "-".repeat(header.length);
-    const body = previews.length ? previews.join("\n") : " (empty)";
-    return `${header}\n${rule}\n${currentLine}${body}${more}`;
+function makeBuildQueueStatus(truncatePreview: (text: string) => string) {
+  return function buildQueueStatus(
+    s: { modelBusy: boolean; queueOwner: boolean; paused: boolean; queue: QueuedItem[] },
+    mode: string,
+    maxPreviews: number,
+    persistInfo: string,
+  ): string {
+    const pendingCount = getPendingCount(s.queue);
+    const failedCount = s.queue.filter((i) => i.status === "failed").length;
+    const lines = [
+      `Mode: ${mode}`,
+      `Model busy: ${s.modelBusy}`,
+      `Queue owner: ${s.queueOwner}`,
+      `Paused: ${s.paused}`,
+      `Queued: ${pendingCount}`,
+      `Failed: ${failedCount}`,
+      `Persist: ${persistInfo}`,
+    ];
+    if (s.queue.length > 0) {
+      lines.push("", "Queue:");
+      s.queue.forEach((item, i) => {
+        const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
+        const retry = item.retries > 0 ? ` (${item.retries} retries)` : "";
+        const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
+        lines.push(` ${i + 1}. ${icon} ${item.preview}${retry} [${age}s ago]`);
+      });
+    } else if (maxPreviews >= 0) {
+      // keep quiet when empty; maxPreviews<0 disables this branch in compact status
+    }
+    return lines.join("\n");
   };
 }
 
@@ -258,19 +225,40 @@ function snapshotState(s: { modelBusy: boolean; queueOwner: boolean; cancelled: 
   };
 }
 
-export const AutoQueuePlugin = {
-  id: "opencode-auto-queue",
-  server: async (ctx: any, options: AutoQueueOptions = {}) => {
-    const client = ctx.client;
+const COMPLETION_PATTERNS = [
+  /all (tasks?|objectives?) (are )?complete/i,
+  /nothing (remaining|more|left) to do/i,
+  /all tests? pass.*nothing remaining/i,
+  /task (is |has been )?complete/i,
+  /work (is |has been )?complete/i,
+  /done\.? (no|nothing) (more|else) (to do|needed)/i,
+  /that (completes|finishes|wraps up) (it|this|everything)/i,
+];
 
-    debugLog("server", "Plugin server starting", { directory: ctx.directory, options });
+function looksComplete(text: string): boolean {
+  return COMPLETION_PATTERNS.some((re) => re.test(text));
+}
+
+/** Thrown from the prompt hook to block admission of a message we queued. */
+class QueuedByAutoQueueError extends Error {
+  constructor(pendingCount: number) {
+    super(`queued by opencode-auto-queue (${pendingCount} pending)`);
+    this.name = "QueuedByAutoQueueError";
+  }
+}
+
+export const AutoQueuePlugin = Plugin.define({
+  id: "opencode-auto-queue",
+
+  async setup(ctx: any) {
+    const options: AutoQueueOptions = (ctx.options ?? {}) as AutoQueueOptions;
+    const locationDir: string = ctx.location?.directory ?? process.cwd();
+
+    debugLog("setup", "Plugin setup starting", { directory: locationDir, options });
 
     const {
-      toastDurationMs = 10_000,
-      emptyToastDurationMs = 4_000,
       maxPreviews = 3,
       previewLength = 28,
-      placeholderTemplate = "Queued; {count} pending",
       defaultMode = "hold",
       maxRetries = 5,
       retryBaseDelayMs = 2_000,
@@ -284,10 +272,9 @@ export const AutoQueuePlugin = {
     } = options;
 
     const truncatePreview = makeTruncate(previewLength);
-    const extractPreview = makeExtractPreview(truncatePreview);
-    const buildToastMessage = makeBuildToastMessage(truncatePreview);
+    const buildQueueStatus = makeBuildQueueStatus(truncatePreview);
 
-    const resolvedPersistPath = persistPath || `${ctx.directory}/.git/queue.json`;
+    const resolvedPersistPath = persistPath || `${locationDir}/.git/queue.json`;
 
     let currentMode: string = defaultMode;
 
@@ -299,34 +286,27 @@ export const AutoQueuePlugin = {
       queue: QueuedItem[];
       lastAssistantResponse: string;
       modelWorking: boolean;
+      textBuffer: string;
     }>();
 
     const workerRunning = new Set<string>();
+    // Sessions whose prompt is being submitted by our own drain loop. The
+    // prompt hook lets these through unconditionally to avoid re-queueing.
+    const sendingNow = new Set<string>();
 
     let persistTimer: ReturnType<typeof setTimeout> | null = null;
-
-    let tickCallCount = 0;
-    let eventCount = 0;
-    let chatMessageCount = 0;
-
-    const COMPLETION_PATTERNS = [
-      /all (tasks?|objectives?) (are )?complete/i,
-      /nothing (remaining|more|left) to do/i,
-      /all tests? pass.*nothing remaining/i,
-      /task (is |has been )?complete/i,
-      /work (is |has been )?complete/i,
-      /done\.? (no|nothing) (more|else) (to do|needed)/i,
-      /that (completes|finishes|wraps up) (it|this|everything)/i,
-    ];
-
-    function looksComplete(text: string): boolean {
-      return COMPLETION_PATTERNS.some((re) => re.test(text));
-    }
+    let fileWatcher: any = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let lastPersistedRaw = "";
+    let disposed = false;
 
     function getSession(sessionID: string) {
       let s = stateBySession.get(sessionID);
       if (!s) {
-        s = { modelBusy: false, queueOwner: false, cancelled: false, paused: false, queue: [], lastAssistantResponse: "", modelWorking: false };
+        s = {
+          modelBusy: false, queueOwner: false, cancelled: false, paused: false,
+          queue: [], lastAssistantResponse: "", modelWorking: false, textBuffer: "",
+        };
         stateBySession.set(sessionID, s);
         debugLog("getSession", "Created new session state", { sessionID });
       }
@@ -335,19 +315,14 @@ export const AutoQueuePlugin = {
 
     async function persistState() {
       if (!persistQueue) return;
-      const queues: Record<string, any[]> = {};
+      const queues: Record<string, PersistedItem[]> = {};
       const pausedSessions: string[] = [];
       for (const [sessionID, s] of stateBySession.entries()) {
-        const serializable = serializeQueue(s.queue);
+        const serializable = s.queue.filter((i) => i.status !== "sent").map(serializeItem);
         if (serializable.length > 0) queues[sessionID] = serializable;
         if (s.paused) pausedSessions.push(sessionID);
       }
-      const state: PersistedState = {
-        version: 1,
-        mode: currentMode,
-        queues,
-        pausedSessions,
-      };
+      const state: PersistedState = { version: 1, mode: currentMode, queues, pausedSessions };
       try {
         const raw = JSON.stringify(state);
         await Bun.write(resolvedPersistPath, raw);
@@ -367,19 +342,6 @@ export const AutoQueuePlugin = {
       }, persistDebounceMs);
     }
 
-    async function restoreState() {
-      if (!persistQueue) return;
-      const state = await loadState(resolvedPersistPath);
-      if (!state) {
-        debugLog("restoreState", "No persisted state found", { path: resolvedPersistPath });
-        return;
-      }
-      debugLog("restoreState", "Loaded persisted state", { path: resolvedPersistPath, mode: state.mode, pausedCount: state.pausedSessions?.length, queueCount: Object.keys(state.queues ?? {}).length });
-      await applyLoadedState(state);
-    }
-
-    let lastPersistedRaw = "";
-
     async function applyLoadedState(state: PersistedState) {
       if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
       if (state.pausedSessions) {
@@ -391,147 +353,178 @@ export const AutoQueuePlugin = {
             debugLog("applyLoadedState", "SKIP session: worker running, avoiding clobber", { sessionID });
             continue;
           }
-          getSession(sessionID).queue = deserializeQueue(items);
+          getSession(sessionID).queue = items.map(deserializeItem);
         }
       }
+    }
+
+    async function restoreState() {
+      if (!persistQueue) return;
+      const state = await loadState(resolvedPersistPath);
+      if (!state) {
+        debugLog("restoreState", "No persisted state found", { path: resolvedPersistPath });
+        return;
+      }
+      debugLog("restoreState", "Loaded persisted state", {
+        path: resolvedPersistPath, mode: state.mode,
+        pausedCount: state.pausedSessions?.length,
+        queueCount: Object.keys(state.queues ?? {}).length,
+      });
+      await applyLoadedState(state);
     }
 
     await restoreState();
 
     if (persistQueue) {
-      (async () => {
+      const reloadExternal = async () => {
         try {
-          const watchDir = resolvedPersistPath.substring(0, resolvedPersistPath.lastIndexOf("/")) || ".";
-          const baseName = resolvedPersistPath.substring(resolvedPersistPath.lastIndexOf("/") + 1);
-          const watcher = Bun.watch(watchDir, { recursive: false });
-          debugLog("fileWatcher", "Watching directory for queue file changes", { watchDir, baseName });
-          for await (const event of watcher) {
-            const changedName = (event as any).fileName;
-            if (changedName && changedName !== baseName) continue;
-            try {
-              const file = Bun.file(resolvedPersistPath);
-              if (!(await file.exists())) continue;
-              const raw = await file.text();
-              if (raw === lastPersistedRaw) continue;
-              const data = JSON.parse(raw);
-              if (!data || data.version !== 1) continue;
-              debugLog("fileWatcher", "External queue change detected, reloading", { event: event.type });
-              await applyLoadedState(data as PersistedState);
-              debugLog("fileWatcher", "State reloaded", { mode: data.mode, queueCount: Object.keys(data.queues ?? {}).length });
-            } catch (e: any) {
-              debugLog("fileWatcher", "Failed to process change", { error: String(e?.message ?? e) });
-            }
-          }
+          const file = Bun.file(resolvedPersistPath);
+          if (!(await file.exists())) return;
+          const raw = await file.text();
+          if (raw === lastPersistedRaw || raw === lastExternalRaw) return;
+          const data = JSON.parse(raw);
+          if (!data || data.version !== 1) return;
+          lastExternalRaw = raw;
+          debugLog("fileWatcher", "External queue change detected, reloading", { mode: data.mode, queueCount: Object.keys(data.queues ?? {}).length });
+          await applyLoadedState(data as PersistedState);
+          debugLog("fileWatcher", "State reloaded", { mode: data.mode });
         } catch (e: any) {
-          debugLog("fileWatcher", "Watcher stopped", { error: String(e?.message ?? e) });
+          debugLog("fileWatcher", "Failed to process change", { error: String(e?.message ?? e) });
         }
-      })();
+      };
+
+      let lastExternalRaw = "";
+      let lastSeenMtime = 0;
+      try {
+        lastSeenMtime = statSync(resolvedPersistPath).mtimeMs;
+      } catch { }
+
+      try {
+        const watchDir = resolvedPersistPath.substring(0, resolvedPersistPath.lastIndexOf("/")) || ".";
+        const baseName = resolvedPersistPath.substring(resolvedPersistPath.lastIndexOf("/") + 1);
+        // Bun.watch is unavailable inside the OpenCode server runtime; use the
+        // Node-compatible fs.watch instead.
+        fileWatcher = fsWatch(watchDir, { recursive: false }, (_eventType, filename) => {
+          if (disposed) return;
+          if (filename && filename !== baseName) return;
+          reloadExternal().catch(() => { });
+        });
+        debugLog("fileWatcher", "Watching directory for queue file changes", { watchDir, baseName });
+      } catch (e: any) {
+        fileWatcher = null;
+        debugLog("fileWatcher", "Watcher stopped", { error: String(e?.message ?? e) });
+      }
+
+      // Polling fallback: inotify does not fire on every filesystem/mount
+      // (container bind mounts, network fs). Poll the file so external edits
+      // via q.py are picked up everywhere.
+      pollTimer = setInterval(() => {
+        if (disposed) return;
+        try {
+          const mtime = statSync(resolvedPersistPath).mtimeMs;
+          if (mtime !== lastSeenMtime) {
+            lastSeenMtime = mtime;
+            reloadExternal().catch(() => { });
+          }
+        } catch { }
+      }, 2_000);
     }
 
-    async function showToast(sessionID: string, forceEmpty = false) {
-      const s = getSession(sessionID);
-      const pending = getPendingCount(s.queue);
-      if (s.queue.length === 0 && !forceEmpty) return;
-      const isEmpty = pending === 0;
-      const variant = isEmpty ? "success" : "info";
-      const duration = isEmpty ? emptyToastDurationMs : toastDurationMs;
-      const message = isEmpty ? "Queue empty. All queued messages sent." : buildToastMessage(s.queue, maxPreviews);
+    /** User-visible feedback. V2 server plugins have no toast API; inject a
+     *  synthetic message instead. */
+    async function notify(sessionID: string, message: string, description = "opencode-auto-queue") {
       try {
-        await client.tui.showToast({
-          body: { title: "Message Queue", message, variant, duration },
-        });
-      } catch {
+        await ctx.session.synthetic({ sessionID, text: message, description });
+      } catch (e: any) {
+        debugLog("notify", "synthetic failed", { sessionID, error: String(e?.message ?? e) });
       }
+    }
+
+    function makeTextItem(sessionID: string, text: string): QueuedItem {
+      return {
+        sessionID,
+        text,
+        preview: extractPreview(text, truncatePreview),
+        status: "queued",
+        retries: 0,
+        enqueuedAt: Date.now(),
+      };
     }
 
     async function tick(sessionID: string) {
-      const tickId = ++tickCallCount;
-      const tickLabel = `tick#${tickId}`;
-
-      debugLog(tickLabel, "Called", { sessionID, workerRunning: workerRunning.has(sessionID) });
-
+      if (disposed) return;
       if (workerRunning.has(sessionID)) {
-        debugLog(tickLabel, "EXIT: worker already running", { sessionID });
+        debugLog("tick", "EXIT: worker already running", { sessionID });
         return;
       }
       const s = getSession(sessionID);
 
-      debugLog(tickLabel, "State at entry", snapshotState(s));
-
       if (s.queue.length === 0) {
-        debugLog(tickLabel, "EXIT: queue empty");
+        debugLog("tick", "EXIT: queue empty", { sessionID });
         return;
       }
       if (s.modelBusy) {
-        debugLog(tickLabel, "EXIT: modelBusy=true");
+        debugLog("tick", "EXIT: modelBusy=true", { sessionID });
         return;
       }
       if (s.paused) {
-        debugLog(tickLabel, "EXIT: paused=true");
+        debugLog("tick", "EXIT: paused=true", { sessionID });
         return;
       }
       if (s.cancelled) {
-        debugLog(tickLabel, "EXIT: cancelled=true, clearing cancelled+queueOwner");
+        debugLog("tick", "EXIT: cancelled=true, clearing cancelled+queueOwner", { sessionID });
         s.cancelled = false;
         s.queueOwner = false;
         return;
       }
 
       workerRunning.add(sessionID);
-      debugLog(tickLabel, "Worker started", { sessionID });
+      debugLog("tick", "Worker started", { sessionID });
       try {
-        if (drainDelayMs > 0) {
-          debugLog(tickLabel, "Sleeping for drainDelay", { drainDelayMs });
-          await sleep(drainDelayMs);
-        }
+        if (drainDelayMs > 0) await sleep(drainDelayMs);
+        if (disposed) return;
 
         const next = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
         if (!next) {
-          debugLog(tickLabel, "EXIT: no queued/failed item found after delay", { queueSummary: s.queue.map((i) => `${i.preview.slice(0, 20)}:${i.status}`) });
+          debugLog("tick", "EXIT: no queued/failed item found after delay", { sessionID });
           return;
         }
 
         if (!s.modelWorking && s.lastAssistantResponse && looksComplete(s.lastAssistantResponse)) {
           const continueCount = s.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
           if (continueCount > 0) {
-            debugLog(tickLabel, "COMPLETION DETECTED: last response indicates task complete, pausing queue instead of draining continues", { continueCount, lastResponse: s.lastAssistantResponse.slice(0, 200) });
+            debugLog("tick", "COMPLETION DETECTED: pausing queue instead of draining continues", {
+              sessionID, continueCount, lastResponse: s.lastAssistantResponse.slice(0, 200),
+            });
             s.paused = true;
-            try {
-              await client.tui.showToast({
-                body: {
-                  title: "Message Queue",
-                  message: `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
-                  variant: "warning",
-                  duration: 10000,
-                },
-              });
-            } catch { }
+            await notify(
+              sessionID,
+              `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
+            );
             schedulePersist();
             return;
           }
         }
 
         if (s.modelBusy) {
-          debugLog(tickLabel, "EXIT: modelBusy became true after delay", snapshotState(s));
+          debugLog("tick", "EXIT: modelBusy became true after delay", { sessionID });
           return;
         }
         if (s.paused) {
-          debugLog(tickLabel, "EXIT: paused became true after delay");
+          debugLog("tick", "EXIT: paused became true after delay", { sessionID });
           return;
         }
         if (s.cancelled) {
-          debugLog(tickLabel, "EXIT: cancelled became true after delay, clearing");
+          debugLog("tick", "EXIT: cancelled became true after delay, clearing", { sessionID });
           s.cancelled = false;
           s.queueOwner = false;
           return;
         }
 
-        debugLog(tickLabel, "Sending item", { preview: next.preview, status: next.status, retries: next.retries });
+        debugLog("tick", "Sending item", { sessionID, preview: next.preview, status: next.status, retries: next.retries });
         next.status = "sending";
         s.queueOwner = true;
-        debugLog(tickLabel, "State after marking sending", snapshotState(s));
         schedulePersist();
-        try { await showToast(sessionID); } catch { }
 
         let sent = false;
         let attempts = 0;
@@ -539,30 +532,29 @@ export const AutoQueuePlugin = {
 
         while (!sent && attempts < maxAttempts) {
           if (s.cancelled) {
-            debugLog(tickLabel, "CANCELLED during send loop, aborting", { attempts });
+            debugLog("tick", "CANCELLED during send loop, aborting", { sessionID, attempts });
             s.cancelled = false;
             s.queueOwner = false;
             next.status = "queued";
             return;
           }
           attempts++;
-          debugLog(tickLabel, "Attempt sending", { attempt: attempts, maxAttempts, preview: next.preview });
           try {
-            const promptArgs = {
-              path: { id: sessionID },
-              body: {
-                agent: next.agent,
-                model: next.model,
-                system: next.system,
-                tools: next.tools,
-                parts: markInternalParts(next.parts),
-              },
-            };
-            debugLog(tickLabel, "Calling session.prompt", { sessionID, agent: next.agent, partsCount: next.parts.length });
-            await client.session.prompt(promptArgs);
-            debugLog(tickLabel, "session.prompt RESOLVED (accepted)", { preview: next.preview });
+            debugLog("tick", "Calling session.prompt", { sessionID, attempt: attempts, preview: next.preview });
+            sendingNow.add(sessionID);
+            try {
+              await ctx.session.prompt({
+                sessionID,
+                text: next.text,
+                files: next.files,
+                agents: next.agents,
+              });
+            } finally {
+              sendingNow.delete(sessionID);
+            }
+            debugLog("tick", "session.prompt RESOLVED (accepted)", { sessionID, preview: next.preview });
             if (s.cancelled) {
-              debugLog(tickLabel, "CANCELLED after prompt resolved, aborting");
+              debugLog("tick", "CANCELLED after prompt resolved, aborting", { sessionID });
               s.cancelled = false;
               s.queueOwner = false;
               next.status = "queued";
@@ -571,44 +563,29 @@ export const AutoQueuePlugin = {
             next.status = "sent";
             next.lastError = undefined;
             sent = true;
-            debugLog(tickLabel, "State after prompt accepted", snapshotState(s));
           } catch (error: any) {
             const errMsg = error instanceof Error ? error.message : String(error);
-            const errName = error?.name ?? "unknown";
-            debugLog(tickLabel, "session.prompt REJECTED", { error: errMsg.slice(0, 200), errorName: errName, isTransient: isTransientError(error), attempt: attempts });
+            debugLog("tick", "session.prompt REJECTED", {
+              sessionID, error: errMsg.slice(0, 200), isTransient: isTransientError(error), attempt: attempts,
+            });
             if (isTransientError(error) && attempts < maxAttempts) {
               next.retries = attempts;
               next.lastError = errMsg;
               next.status = "failed";
               const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
-              debugLog(tickLabel, "Transient error, retrying", { delay, attempt: attempts });
-              try {
-                await client.tui.showToast({
-                  body: {
-                    title: "Message Queue",
-                    message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
-                    variant: "warning",
-                    duration: delay + 2000,
-                  },
-                });
-              } catch { }
+              debugLog("tick", "Transient error, retrying", { sessionID, delay, attempt: attempts });
+              await notify(
+                sessionID,
+                `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
+              );
               await sleep(delay);
               next.status = "queued";
             } else {
               next.retries = attempts;
               next.lastError = errMsg;
               next.status = "failed";
-              debugLog(tickLabel, "Non-transient error or max retries, marking failed", { attempt: attempts, preview: next.preview });
-              try {
-                await client.tui.showToast({
-                  body: {
-                    title: "Message Queue",
-                    message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
-                    variant: "error",
-                    duration: toastDurationMs,
-                  },
-                });
-              } catch { }
+              debugLog("tick", "Non-transient error or max retries, marking failed", { sessionID, attempt: attempts });
+              await notify(sessionID, `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`);
               break;
             }
           }
@@ -616,290 +593,38 @@ export const AutoQueuePlugin = {
 
         const beforeFilter = s.queue.length;
         s.queue = s.queue.filter((item) => item.status !== "sent");
-        debugLog(tickLabel, "Filtered sent items", { before: beforeFilter, after: s.queue.length, sent });
+        debugLog("tick", "Filtered sent items", { sessionID, before: beforeFilter, after: s.queue.length, sent });
         schedulePersist();
-        try { await showToast(sessionID); } catch { }
-
-        debugLog(tickLabel, "State after send completion", { sent, ...snapshotState(s) });
 
         if (sent) {
           s.queueOwner = true;
           const hasMore = s.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
           if (hasMore) {
-            debugLog(tickLabel, "Item sent successfully, queue has more items, scheduling re-tick (idle may have been consumed during await)", { queueRemaining: s.queue.length });
+            debugLog("tick", "Item sent, queue has more items, scheduling re-tick", { sessionID, queueRemaining: s.queue.length });
             setTimeout(() => tick(sessionID).catch(() => { }), 0);
           } else {
-            debugLog(tickLabel, "Item sent successfully, queue empty, waiting for idle event if more items arrive", { queueRemaining: s.queue.length, queueOwner: s.queueOwner });
+            debugLog("tick", "Item sent, queue empty, waiting for idle", { sessionID });
           }
         } else if (next.status === "failed") {
           const more = s.queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
           if (more) {
-            debugLog(tickLabel, "Send failed permanently, but more items in queue, re-ticking", { morePreview: more.preview });
+            debugLog("tick", "Send failed permanently, but more items in queue, re-ticking", { sessionID });
             s.queueOwner = false;
             tick(sessionID).catch(() => { });
           } else {
-            debugLog(tickLabel, "Send failed permanently, no more items to process");
             s.queueOwner = false;
           }
         }
       } finally {
         workerRunning.delete(sessionID);
-        debugLog(tickLabel, "Worker finished", { sessionID, state: snapshotState(s) });
+        debugLog("tick", "Worker finished", { sessionID, state: snapshotState(s) });
       }
     }
 
-    function makeTextItem(sessionID: string, text: string): QueuedItem {
-      const truncate = makeTruncate(previewLength);
-      const extract = makeExtractPreview(truncate);
-      const parts = [{ type: "text", text }];
-      return {
-        sessionID,
-        parts,
-        preview: extract(parts),
-        status: "queued",
-        retries: 0,
-        enqueuedAt: Date.now(),
-      };
-    }
-
-    const queueTool = tool({
-      description:
-        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, cancel, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Only switch modes when explicitly requested.",
-      args: {
-        action: tool.schema
-          .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "cancel", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get"])
-          .optional()
-          .describe("Action to perform"),
-        index: tool.schema
-          .number()
-          .optional()
-          .describe("1-based index for drop/delete/get/set"),
-        to: tool.schema
-          .number()
-          .optional()
-          .describe("Target position for reorder"),
-        text: tool.schema
-          .string()
-          .optional()
-          .describe("Text content for insert/append/prepend/set"),
-      },
-      async execute({ action, index, to, text }: { action?: string; index?: number; to?: number; text?: string }, ctx: any) {
-        const nextAction = action ?? "status";
-        debugLog("tool", "Queue tool invoked", { action: nextAction, index, to, textLen: text?.length, sessionID: ctx.sessionID });
-        const s = getSession(ctx.sessionID);
-        const pendingCount = getPendingCount(s.queue);
-        const failedCount = s.queue.filter((i) => i.status === "failed").length;
-
-        if (nextAction === "status") {
-          const lines = [
-            `Mode: ${currentMode}`,
-            `Model busy: ${s.modelBusy}`,
-            `Queue owner: ${s.queueOwner}`,
-            `Paused: ${s.paused}`,
-            `Queued: ${pendingCount}`,
-            `Failed: ${failedCount}`,
-            `Persist: ${persistQueue}${persistQueue ? ` (${resolvedPersistPath})` : ""}`,
-          ];
-          if (s.queue.length > 0) {
-            lines.push("", "Queue:");
-            s.queue.forEach((item, i) => {
-              const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
-              const retry = item.retries > 0 ? ` (${item.retries} retries)` : "";
-              const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
-              lines.push(` ${i + 1}. ${icon} ${item.preview}${retry} [${age}s ago]`);
-            });
-          }
-          return lines.join("\n");
-        }
-
-        if (nextAction === "config") {
-          return [
-            "Queue Configuration:",
-            ` mode: ${currentMode} (default: ${defaultMode})`,
-            ` maxQueueSize: ${maxQueueSize}`,
-            ` maxRetries: ${maxRetries}`,
-            ` retryBaseDelayMs: ${retryBaseDelayMs}`,
-            ` retryMaxDelayMs: ${retryMaxDelayMs}`,
-            ` drainDelayMs: ${drainDelayMs}`,
-            ` autoRetryOnIdle: ${autoRetryOnIdle}`,
-            ` persistQueue: ${persistQueue}`,
-            ` persistPath: ${resolvedPersistPath}`,
-            ` persistDebounceMs: ${persistDebounceMs}`,
-            ` previewLength: ${previewLength}`,
-            ` maxPreviews: ${maxPreviews}`,
-            ` toastDurationMs: ${toastDurationMs}`,
-            ` emptyToastDurationMs: ${emptyToastDurationMs}`,
-            ` placeholderTemplate: "${placeholderTemplate}"`,
-          ].join("\n");
-        }
-
-        if (nextAction === "count") {
-          return `${pendingCount} messages in queue (${failedCount} failed)`;
-        }
-
-        if (nextAction === "peek") {
-          const next = s.queue.find((item) => item.status === "queued" || item.status === "failed");
-          if (!next) return "Queue is empty";
-          const retry = next.retries > 0 ? ` (retried ${next.retries}x)` : "";
-          const age = Math.round((Date.now() - next.enqueuedAt) / 1000);
-          return `Next: ${next.preview}${retry} [waiting ${age}s]`;
-        }
-
-        if (nextAction === "hold") {
-          if (currentMode === "hold") return `Mode: hold`;
-          currentMode = "hold";
-          schedulePersist();
-          return `Mode: hold (messages queued when busy)`;
-        }
-
-        if (nextAction === "immediate") {
-          if (currentMode === "immediate") return `Mode: immediate`;
-          currentMode = "immediate";
-          schedulePersist();
-          tick(ctx.sessionID).catch(() => { });
-          return `Mode: immediate (messages sent right away)`;
-        }
-
-        if (nextAction === "clear") {
-          const cleared = s.queue.length;
-          s.queue = [];
-          s.queueOwner = false;
-          schedulePersist();
-          try { await showToast(ctx.sessionID, true); } catch { }
-          return `Cleared ${cleared} messages from queue`;
-        }
-
-        if (nextAction === "drop") {
-          const idx = (index ?? 1) - 1;
-          if (idx < 0 || idx >= s.queue.length) return `Invalid index. Queue has ${s.queue.length} items.`;
-          const dropped = s.queue.splice(idx, 1)[0];
-          schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { }
-          return `Dropped: ${dropped.preview}`;
-        }
-
-        if (nextAction === "retry") {
-          const failedItems = s.queue.filter((i) => i.status === "failed");
-          if (failedItems.length === 0) return "No failed items to retry.";
-          for (const item of failedItems) {
-            item.status = "queued";
-            item.retries = 0;
-            item.lastError = undefined;
-          }
-          schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { }
-          tick(ctx.sessionID).catch(() => { });
-          return `Retrying ${failedItems.length} failed messages`;
-        }
-
-        if (nextAction === "pause") {
-          s.paused = true;
-          schedulePersist();
-          return "Queue paused.";
-        }
-
-        if (nextAction === "resume") {
-          s.paused = false;
-          schedulePersist();
-          tick(ctx.sessionID).catch(() => { });
-          return "Queue resumed. Draining pending messages.";
-        }
-
-        if (nextAction === "cancel") {
-          s.cancelled = true;
-          s.queueOwner = false;
-          schedulePersist();
-          return "Queue drain cancelled. No more items will be auto-sent.";
-        }
-
-        if (nextAction === "reorder") {
-          const from = index ?? 1;
-          const target = to ?? 1;
-          if (from < 1 || from > s.queue.length || target < 1 || target > s.queue.length)
-            return `Index out of range. Queue has ${s.queue.length} items.`;
-          const [item] = s.queue.splice(from - 1, 1);
-          s.queue.splice(target - 1, 0, item);
-          schedulePersist();
-          return `Moved item ${from} to position ${target}`;
-        }
-
-        if (nextAction === "insert") {
-          const idx = index ?? 1;
-          if (!text) return "No text provided.";
-          if (idx < 1 || idx > s.queue.length + 1) return `Index out of range. Queue has ${s.queue.length} items.`;
-          const item = makeTextItem(ctx.sessionID, text);
-          s.queue.splice(idx - 1, 0, item);
-          schedulePersist();
-          return `Inserted at position ${idx}: ${item.preview}`;
-        }
-
-        if (nextAction === "append") {
-          if (!text) return "No text provided.";
-          const item = makeTextItem(ctx.sessionID, text);
-          s.queue.push(item);
-          schedulePersist();
-          return `Appended: ${item.preview}`;
-        }
-
-        if (nextAction === "prepend") {
-          if (!text) return "No text provided.";
-          const item = makeTextItem(ctx.sessionID, text);
-          s.queue.unshift(item);
-          schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { }
-          return `Prepended: ${item.preview}`;
-        }
-
-        if (nextAction === "delete") {
-          const idx = index ?? 1;
-          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
-          const dropped = s.queue.splice(idx - 1, 1)[0];
-          schedulePersist();
-          try { await showToast(ctx.sessionID); } catch { }
-          return `Deleted: ${dropped.preview}`;
-        }
-
-        if (nextAction === "set") {
-          const idx = index ?? 1;
-          if (!text) return "No text provided.";
-          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
-          const item = makeTextItem(ctx.sessionID, text);
-          s.queue[idx - 1] = item;
-          schedulePersist();
-          return `Set position ${idx}: ${item.preview}`;
-        }
-
-        if (nextAction === "sort") {
-          s.queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
-          schedulePersist();
-          return `Sorted ${s.queue.length} items by time (oldest first)`;
-        }
-
-        if (nextAction === "invert") {
-          s.queue.reverse();
-          schedulePersist();
-          return `Reversed ${s.queue.length} items`;
-        }
-
-        if (nextAction === "get") {
-          const idx = index ?? 1;
-          if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
-          const item = s.queue[idx - 1];
-          const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
-          const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
-          const err = item.lastError ? `\nError: ${item.lastError}` : "";
-          const textParts = item.parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
-          return [
-            `Item ${idx}/${s.queue.length} status: ${item.status} age: ${age}s${retry}${err}`,
-            `Preview: ${item.preview}`,
-            `Content:`,
-            textParts || "(no text content)",
-          ].join("\n");
-        }
-
-        return `Unknown action: ${nextAction}`;
-      },
-    });
+    // ---------------------------------------------------------------
+    // Shared action handler for the queue tool and queue-* commands.
+    // Returns a human-readable result string.
+    // ---------------------------------------------------------------
 
     const VALID_SLASH_COMMANDS = [
       "hold", "immediate", "status", "clear", "pause", "resume", "cancel", "count",
@@ -914,84 +639,100 @@ export const AutoQueuePlugin = {
     function normalizeCommandName(cmd: string): string {
       let name = cmd.replace(/^\//, "").toLowerCase();
       if (name.startsWith("queue-")) name = name.slice("queue-".length);
-      return name;
+      if (name.startsWith("queue ")) name = name.slice("queue ".length).trim();
+      return name.trim();
     }
 
-    function handleSlashCommand(cmd: string, args: string, sessionID: string): string | null {
-      const normalized = normalizeCommandName(cmd);
-      if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
-
-      debugLog("slashCmd", "Handling slash command", { cmd, normalized, argsLen: args.length, sessionID });
-
+    async function handleAction(rawCmd: string, args: string, sessionID: string): Promise<string | null> {
+      const normalized = normalizeCommandName(rawCmd);
       const s = getSession(sessionID);
       const pendingCount = getPendingCount(s.queue);
       const failedCount = s.queue.filter((i) => i.status === "failed").length;
 
       switch (normalized) {
-        case "hold": {
-          if (currentMode === "hold") return `Queue mode: hold (already active)`;
+        case "hold":
+          if (currentMode === "hold") return "Queue mode: hold (already active)";
           currentMode = "hold";
           schedulePersist();
-          return `Queue mode: hold (messages queued when busy)`;
-        }
-        case "immediate": {
-          if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
+          return "Queue mode: hold (messages queued when busy)";
+        case "immediate":
+          if (currentMode === "immediate") return "Queue mode: immediate (already active)";
           currentMode = "immediate";
           schedulePersist();
           tick(sessionID).catch(() => { });
-          return `Queue mode: immediate (messages sent right away)`;
-        }
-        case "status": {
-          const lines = [
-            `Mode: ${currentMode}`,
-            `Model busy: ${s.modelBusy}`,
-            `Queue owner: ${s.queueOwner}`,
-            `Paused: ${s.paused}`,
-            `Queued: ${pendingCount}`,
-            `Failed: ${failedCount}`,
-          ];
-          if (s.queue.length > 0) {
-            lines.push("", "Queue:");
-            s.queue.forEach((item, i) => {
-              const icon = item.status === "sent" ? "[x]" : item.status === "sending" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
-              lines.push(` ${i + 1}. ${icon} ${item.preview}`);
-            });
-          }
-          return lines.join("\n");
+          return "Queue mode: immediate (messages sent right away)";
+        case "status":
+          return buildQueueStatus(s, currentMode, maxPreviews, persistQueue ? `true (${resolvedPersistPath})` : "false");
+        case "config":
+          return [
+            "Queue Configuration:",
+            ` mode: ${currentMode} (default: ${defaultMode})`,
+            ` maxQueueSize: ${maxQueueSize}`,
+            ` maxRetries: ${maxRetries}`,
+            ` retryBaseDelayMs: ${retryBaseDelayMs}`,
+            ` retryMaxDelayMs: ${retryMaxDelayMs}`,
+            ` drainDelayMs: ${drainDelayMs}`,
+            ` autoRetryOnIdle: ${autoRetryOnIdle}`,
+            ` persistQueue: ${persistQueue}`,
+            ` persistPath: ${resolvedPersistPath}`,
+            ` persistDebounceMs: ${persistDebounceMs}`,
+            ` previewLength: ${previewLength}`,
+            ` maxPreviews: ${maxPreviews}`,
+          ].join("\n");
+        case "count":
+          return `${pendingCount} messages in queue (${failedCount} failed)`;
+        case "peek": {
+          const next = s.queue.find((item) => item.status === "queued" || item.status === "failed");
+          if (!next) return "Queue is empty";
+          const retry = next.retries > 0 ? ` (retried ${next.retries}x)` : "";
+          const age = Math.round((Date.now() - next.enqueuedAt) / 1000);
+          return `Next: ${next.preview}${retry} [waiting ${age}s]`;
         }
         case "clear": {
           const cleared = s.queue.length;
           s.queue = [];
           s.queueOwner = false;
           schedulePersist();
-          showToast(sessionID, true).catch(() => { });
           return `Cleared ${cleared} messages from queue`;
         }
-        case "pause": {
+        case "drop": {
+          const idx = parseIndex(args) ?? 1;
+          if (idx < 1 || idx > s.queue.length) return `Invalid index. Queue has ${s.queue.length} items.`;
+          const dropped = s.queue.splice(idx - 1, 1)[0];
+          schedulePersist();
+          return `Dropped: ${dropped.preview}`;
+        }
+        case "retry": {
+          const failedItems = s.queue.filter((i) => i.status === "failed");
+          if (failedItems.length === 0) return "No failed items to retry.";
+          for (const item of failedItems) {
+            item.status = "queued";
+            item.retries = 0;
+            item.lastError = undefined;
+          }
+          schedulePersist();
+          tick(sessionID).catch(() => { });
+          return `Retrying ${failedItems.length} failed messages`;
+        }
+        case "pause":
           s.paused = true;
           schedulePersist();
           return "Queue paused.";
-        }
-        case "resume": {
+        case "resume":
           s.paused = false;
           schedulePersist();
           tick(sessionID).catch(() => { });
           return "Queue resumed. Draining pending messages.";
-        }
-        case "cancel": {
+        case "cancel":
           s.cancelled = true;
           s.queueOwner = false;
           schedulePersist();
           return "Queue drain cancelled. No more items will be auto-sent.";
-        }
-        case "count": {
-          return `${pendingCount} messages in queue (${failedCount} failed)`;
-        }
         case "reorder": {
           const parts = args.trim().split(/\s+/);
           const from = parseIndex(parts[0]);
           const to = parseIndex(parts[1]);
-          if (!from || !to) return "Usage: /reorder <from> <to> (1-based indices)";
+          if (!from || !to) return "Usage: reorder <from> <to> (1-based indices)";
           if (from > s.queue.length || to > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
           const [item] = s.queue.splice(from - 1, 1);
           s.queue.splice(to - 1, 0, item);
@@ -1000,7 +741,7 @@ export const AutoQueuePlugin = {
         }
         case "insert": {
           const firstSpace = args.indexOf(" ");
-          if (firstSpace === -1) return "Usage: /insert <index> <text>";
+          if (firstSpace === -1) return "Usage: insert <index> <text>";
           const idx = parseIndex(args.slice(0, firstSpace));
           const txt = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index. Must be a positive number.";
@@ -1013,7 +754,7 @@ export const AutoQueuePlugin = {
         }
         case "append": {
           const txt = args.trim();
-          if (!txt) return "Usage: /append <text>";
+          if (!txt) return "Usage: append <text>";
           const item = makeTextItem(sessionID, txt);
           s.queue.push(item);
           schedulePersist();
@@ -1021,25 +762,23 @@ export const AutoQueuePlugin = {
         }
         case "prepend": {
           const txt = args.trim();
-          if (!txt) return "Usage: /prepend <text>";
+          if (!txt) return "Usage: prepend <text>";
           const item = makeTextItem(sessionID, txt);
           s.queue.unshift(item);
           schedulePersist();
-          showToast(sessionID).catch(() => { });
           return `Prepended: ${item.preview}`;
         }
         case "delete": {
           const idx = parseIndex(args.trim());
-          if (!idx) return "Usage: /delete <index> (1-based)";
+          if (!idx) return "Usage: delete <index> (1-based)";
           if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
           const dropped = s.queue.splice(idx - 1, 1)[0];
           schedulePersist();
-          showToast(sessionID).catch(() => { });
           return `Deleted: ${dropped.preview}`;
         }
         case "set": {
           const firstSpace = args.indexOf(" ");
-          if (firstSpace === -1) return "Usage: /set <index> <text>";
+          if (firstSpace === -1) return "Usage: set <index> <text>";
           const idx = parseIndex(args.slice(0, firstSpace));
           const txt = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index.";
@@ -1050,30 +789,27 @@ export const AutoQueuePlugin = {
           schedulePersist();
           return `Set position ${idx}: ${item.preview}`;
         }
-        case "sort": {
+        case "sort":
           s.queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
           schedulePersist();
           return `Sorted ${s.queue.length} items by time (oldest first)`;
-        }
-        case "invert": {
+        case "invert":
           s.queue.reverse();
           schedulePersist();
           return `Reversed ${s.queue.length} items`;
-        }
         case "get": {
           const idx = parseIndex(args.trim());
-          if (!idx) return "Usage: /get <index> (1-based)";
+          if (!idx) return "Usage: get <index> (1-based)";
           if (idx < 1 || idx > s.queue.length) return `Index out of range. Queue has ${s.queue.length} items.`;
           const item = s.queue[idx - 1];
           const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
           const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
           const err = item.lastError ? `\nError: ${item.lastError}` : "";
-          const textParts = item.parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
           return [
             `Item ${idx}/${s.queue.length} status: ${item.status} age: ${age}s${retry}${err}`,
             `Preview: ${item.preview}`,
             `Content:`,
-            textParts || "(no text content)",
+            item.text || "(no text content)",
           ].join("\n");
         }
         default:
@@ -1081,318 +817,293 @@ export const AutoQueuePlugin = {
       }
     }
 
-    const queueCommands: Record<string, { template: string; description: string }> = {
-      "queue-hold": { template: "$ARGUMENTS", description: "Switch queue to hold mode (auto-drain on idle)" },
-      "queue-immediate": { template: "$ARGUMENTS", description: "Switch queue to immediate mode" },
-      "queue-status": { template: "$ARGUMENTS", description: "Show queue status" },
-      "queue-clear": { template: "$ARGUMENTS", description: "Clear the queue" },
-      "queue-pause": { template: "$ARGUMENTS", description: "Pause auto-drain" },
-      "queue-resume": { template: "$ARGUMENTS", description: "Resume auto-drain" },
-      "queue-cancel": { template: "$ARGUMENTS", description: "Cancel active queue drain" },
-      "queue-count": { template: "$ARGUMENTS", description: "Show pending item count" },
-      "queue-reorder": { template: "$ARGUMENTS", description: "Reorder: /queue-reorder <from> <to>" },
-      "queue-insert": { template: "$ARGUMENTS", description: "Insert: /queue-insert <pos> <text>" },
-      "queue-append": { template: "$ARGUMENTS", description: "Append text to queue" },
-      "queue-prepend": { template: "$ARGUMENTS", description: "Prepend text to queue" },
-      "queue-delete": { template: "$ARGUMENTS", description: "Delete: /queue-delete <index>" },
-      "queue-set": { template: "$ARGUMENTS", description: "Set: /queue-set <index> <text>" },
-      "queue-sort": { template: "$ARGUMENTS", description: "Sort queue by time" },
-      "queue-invert": { template: "$ARGUMENTS", description: "Reverse queue order" },
-      "queue-get": { template: "$ARGUMENTS", description: "Get: /queue-get <index>" },
+    // ---------------------------------------------------------------
+    // Tool registration: "queue" tool with all actions.
+    // ---------------------------------------------------------------
+
+    await ctx.tool.transform((editor: any) => {
+      editor.add({
+        name: "queue",
+        description:
+          "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, cancel, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Only switch modes when explicitly requested.",
+        input: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "cancel", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get"],
+              description: "Action to perform",
+            },
+            args: {
+              type: "string",
+              description: "Arguments for the action (e.g. '2' for delete, '2 new text' for set, '1 3' for reorder)",
+            },
+          },
+          required: ["action"],
+          additionalProperties: false,
+        },
+        async execute(input: any, context: any) {
+          const action = input?.action ?? "status";
+          const args = input?.args ?? "";
+          const sessionID = context?.sessionID;
+          debugLog("tool", "Queue tool invoked", { action, args, sessionID });
+          if (!sessionID) return { content: "queue tool requires a session context" };
+          const result = await handleAction(action, args, sessionID);
+          return { content: result ?? `Unknown action: ${action}` };
+        },
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // Command registration: /queue-* commands.
+    // ---------------------------------------------------------------
+
+    const commandDescriptions: Record<string, string> = {
+      "queue-hold": "Switch queue to hold mode (auto-drain on idle)",
+      "queue-immediate": "Switch queue to immediate mode",
+      "queue-status": "Show queue status",
+      "queue-clear": "Clear the queue",
+      "queue-pause": "Pause auto-drain",
+      "queue-resume": "Resume auto-drain",
+      "queue-cancel": "Cancel active queue drain",
+      "queue-count": "Show pending item count",
+      "queue-reorder": "Reorder: /queue-reorder <from> <to>",
+      "queue-insert": "Insert: /queue-insert <pos> <text>",
+      "queue-append": "Append text to queue",
+      "queue-prepend": "Prepend text to queue",
+      "queue-delete": "Delete: /queue-delete <index>",
+      "queue-set": "Set: /queue-set <index> <text>",
+      "queue-sort": "Sort queue by time",
+      "queue-invert": "Reverse queue order",
+      "queue-get": "Get: /queue-get <index>",
     };
 
-    debugLog("server", "Plugin server ready, returning hooks");
+    await ctx.command.transform((editor: any) => {
+      for (const [name, description] of Object.entries(commandDescriptions)) {
+        editor.add({
+          name,
+          description,
+          execute: async ({ sessionID, prompt }: any) => {
+            const args = prompt?.text ?? "";
+            debugLog("command", "Command invoked", { name, sessionID, argsLen: args.length });
+            const result = await handleAction(name, args, sessionID);
+            if (result === null) return;
+            await notify(sessionID, result);
+          },
+        });
+      }
+    });
 
-    return {
-      tool: { queue: queueTool },
+    // ---------------------------------------------------------------
+    // Prompt hook: the queueing core. Runs before durable inbox admission.
+    // ---------------------------------------------------------------
 
-      config: async (inputConfig: any) => {
-        debugLog("config", "Config hook called", { keys: Object.keys(inputConfig ?? {}) });
-      },
+    await ctx.session.hook("prompt", async (event: any) => {
+      if (disposed) return;
+      const sessionID: string = event.sessionID;
+      if (!sessionID) return;
+      const text: string = event.prompt?.text ?? "";
+      const files = event.prompt?.files;
+      const agents = event.prompt?.agents;
 
-      "command.execute.before": async (
-        input: { command: string; sessionID: string; arguments: string },
-        output: { parts: any[] },
-      ) => {
-        debugLog("command.before", "Command intercepted", { command: input.command, sessionID: input.sessionID, argsLen: input.arguments?.length });
-        const result = handleSlashCommand(input.command, input.arguments ?? "", input.sessionID);
-        if (result === null) return;
-        output.parts = markInternalParts([{ type: "text", text: result }]);
-      },
-
-      event: async ({ event }: { event: any }) => {
-        const eNum = ++eventCount;
-        const eLabel = `event#${eNum}`;
-
-        debugLog(eLabel, "Event received", { type: event.type, sessionID: event.properties?.sessionID, props: Object.keys(event.properties ?? {}) });
-
-        const s = getSession(event.properties?.sessionID);
-        if (!s) {
-          debugLog(eLabel, "EXIT: no session for event properties", { type: event.type });
-          return;
-        }
-
-        if (event.type === "session.status") {
-          const { sessionID, status } = event.properties;
-          const sess = getSession(sessionID);
-          const nowBusy = status.type !== "idle";
-          const wasBusy = sess.modelBusy;
-
-          debugLog(eLabel, "session.status", { sessionID, statusType: status.type, nowBusy, wasBusy, queueOwnerBefore: sess.queueOwner, queueLen: sess.queue.length });
-
-          sess.modelBusy = nowBusy;
-
-      if (wasBusy && !nowBusy) {
-        const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
-        if (hasQueued) {
-          if (!sess.modelWorking && sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
-            const continueCount = sess.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
-            if (continueCount > 0) {
-              debugLog(eLabel, "COMPLETION DETECTED: last response indicates task complete, NOT auto-draining continues", { sessionID, continueCount, lastResponse: sess.lastAssistantResponse.slice(0, 200) });
-              sess.paused = true;
-              try {
-                await client.tui.showToast({
-                  body: {
-                    title: "Message Queue",
-                    message: `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
-                    variant: "warning",
-                    duration: 10000,
-                  },
-                });
-              } catch { }
-              schedulePersist();
-            }
-          } else {
-            debugLog(eLabel, "session.status: busy->idle AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
-            sess.queueOwner = false;
-            sess.cancelled = false;
-            tick(sessionID).catch(() => { });
-          }
-        } else {
-          debugLog(eLabel, "session.status: busy->idle, no queued items to drain", { sessionID });
-        }
-      } else {
-        debugLog(eLabel, "session.status: no idle transition, no action", { sessionID, wasBusy, nowBusy });
+      if (sendingNow.has(sessionID)) {
+        debugLog("prompt", "EXIT: our own drain prompt, passing through", { sessionID });
+        return;
       }
 
-          debugLog(eLabel, "session.status: state after", snapshotState(sess));
+      if (currentMode !== "hold") {
+        debugLog("prompt", "EXIT: not in hold mode", { sessionID, mode: currentMode });
+        return;
+      }
+
+      const s = getSession(sessionID);
+
+      if (!s.modelBusy) {
+        debugLog("prompt", "Model NOT busy -> letting message through (setting modelBusy=true)", { sessionID });
+        s.modelBusy = true;
+        if (s.cancelled) {
+          debugLog("prompt", "Clearing stale cancelled flag (fresh user message)", { sessionID });
+          s.cancelled = false;
+        }
+        return;
+      }
+
+      debugLog("prompt", "Model IS busy -> queuing message", { sessionID, queueLenBefore: s.queue.length });
+
+      if (s.queue.length >= maxQueueSize) {
+        debugLog("prompt", "Queue FULL, dropping message", { sessionID, maxQueueSize });
+        await notify(sessionID, `Queue full (${maxQueueSize} max). Message dropped.`);
+        throw new QueuedByAutoQueueError(s.queue.length);
+      }
+
+      const item: QueuedItem = {
+        sessionID,
+        text,
+        files: files && files.length > 0 ? files : undefined,
+        agents: agents && agents.length > 0 ? agents : undefined,
+        preview: extractPreview(text, truncatePreview),
+        status: "queued",
+        retries: 0,
+        enqueuedAt: Date.now(),
+      };
+      s.queue.push(item);
+      schedulePersist();
+
+      debugLog("prompt", "Message enqueued, blocking admission", {
+        sessionID, preview: item.preview, queueLenAfter: s.queue.length,
+      });
+      await notify(sessionID, `Queued (${getPendingCount(s.queue)} pending): ${item.preview}`);
+
+      // Blocking admission is how a queued prompt is "swallowed": the hook
+      // throwing fails preparation, so OpenCode does not admit the prompt.
+      throw new QueuedByAutoQueueError(getPendingCount(s.queue));
+    });
+
+    // ---------------------------------------------------------------
+    // Event stream: busy tracking, completion detection, abort handling.
+    // ---------------------------------------------------------------
+
+    const controller = new AbortController();
+
+    const isOtherLocation = (ev: any) =>
+      ev?.location?.directory && ctx.location?.directory && ev.location.directory !== ctx.location.directory;
+
+    async function handleIdleTransition(sessionID: string, source: string, wasBusy: boolean) {
+      const s = getSession(sessionID);
+      s.modelBusy = false;
+      debugLog(source, "idle", { sessionID, wasBusy, queueOwnerBefore: s.queueOwner, queueLen: s.queue.length });
+      if (!wasBusy) {
+        debugLog(source, "was NOT busy, ignoring (duplicate idle?)", { sessionID });
+        return;
+      }
+      const hasQueued = s.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+      if (!hasQueued) {
+        debugLog(source, "was busy, no queued items to drain", { sessionID });
+        return;
+      }
+      if (!s.modelWorking && s.lastAssistantResponse && looksComplete(s.lastAssistantResponse)) {
+        const continueCount = s.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
+        if (continueCount > 0) {
+          debugLog(source, "COMPLETION DETECTED: not auto-draining continues", {
+            sessionID, continueCount, lastResponse: s.lastAssistantResponse.slice(0, 200),
+          });
+          s.paused = true;
+          await notify(
+            sessionID,
+            `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
+          );
+          schedulePersist();
           return;
         }
+      }
+      debugLog(source, "busy->idle with queued items, ticking", { sessionID });
+      s.queueOwner = false;
+      s.cancelled = false;
+      tick(sessionID).catch(() => { });
+    }
 
-        if (event.type === "session.idle") {
-          const { sessionID } = event.properties;
-          const sess = getSession(sessionID);
-          const wasBusy = sess.modelBusy;
+    (async () => {
+      try {
+        for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+          if (disposed) return;
+          if (!ev || typeof ev.type !== "string") continue;
+          const data = ev.data ?? {};
+          const sessionID: string | undefined = data.sessionID;
+          if (!sessionID) continue;
+          if (isOtherLocation(ev)) continue;
+          const s = getSession(sessionID);
 
-          debugLog(eLabel, "session.idle", { sessionID, wasBusy, queueOwnerBefore: sess.queueOwner, queueLen: sess.queue.length });
-
-          sess.modelBusy = false;
-
-          if (wasBusy) {
-            const hasQueued = sess.queue.some((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
-            if (hasQueued) {
-              if (!sess.modelWorking && sess.lastAssistantResponse && looksComplete(sess.lastAssistantResponse)) {
-                const continueCount = sess.queue.filter((item) => item.status === "queued" && item.preview.toLowerCase().includes("continue")).length;
-                if (continueCount > 0) {
-                  debugLog(eLabel, "COMPLETION DETECTED: last response indicates task complete, NOT auto-draining continues", { sessionID, continueCount, lastResponse: sess.lastAssistantResponse.slice(0, 200) });
-                  sess.paused = true;
-                  try {
-                    await client.tui.showToast({
-                      body: {
-                        title: "Message Queue",
-                        message: `Last response looked complete. Skipping ${continueCount} queued "continue" message${continueCount > 1 ? "s" : ""} — resume manually if more work is needed.`,
-                        variant: "warning",
-                        duration: 10000,
-                      },
-                    });
-                  } catch { }
-                  schedulePersist();
-                }
-              } else {
-                debugLog(eLabel, "session.idle: was busy AND queue has items, clearing queueOwner/cancelled and ticking", { sessionID, queueOwnerBefore: sess.queueOwner, cancelledBefore: sess.cancelled, queueRemaining: sess.queue.length });
-                sess.queueOwner = false;
-                sess.cancelled = false;
-                tick(sessionID).catch(() => { });
+          switch (ev.type) {
+            case "session.status": {
+              const nowBusy = data.status?.type !== "idle";
+              const wasBusy = s.modelBusy;
+              s.modelBusy = nowBusy;
+              debugLog("event", "session.status", { sessionID, statusType: data.status?.type, nowBusy, wasBusy });
+              if (wasBusy && !nowBusy) await handleIdleTransition(sessionID, "session.status", wasBusy);
+              break;
+            }
+            case "session.idle": {
+              const wasBusy = s.modelBusy;
+              await handleIdleTransition(sessionID, "session.idle", wasBusy);
+              break;
+            }
+            case "session.execution.interrupted": {
+              // User pressed escape / session interrupted: stop draining.
+              debugLog("event", "session.execution.interrupted", { sessionID, reason: data.reason });
+              if (data.reason === "user" || data.reason === "superseded") {
+                s.cancelled = true;
+                s.queueOwner = false;
+                s.modelBusy = false;
               }
-            } else {
-              debugLog(eLabel, "session.idle: was busy, no queued items to drain", { sessionID });
+              break;
             }
-          } else {
-            debugLog(eLabel, "session.idle: was NOT busy, ignoring (duplicate idle?)", { sessionID });
-          }
-
-          debugLog(eLabel, "session.idle: state after", snapshotState(sess));
-          return;
-        }
-
-        if (event.type === "session.error") {
-          const { sessionID, error } = event.properties ?? {};
-          debugLog(eLabel, "session.error", { sessionID, errorName: error?.name, errorMsg: error?.message?.slice(0, 200) });
-          if (sessionID) {
-            const sess = getSession(sessionID);
-            debugLog(eLabel, "session.error: state before", snapshotState(sess));
-            if (error?.name === "MessageAbortedError") {
-              debugLog(eLabel, "session.error: MessageAbortedError detected, setting cancelled=true", { sessionID });
-              sess.cancelled = true;
-              sess.queueOwner = false;
-              sess.modelBusy = false;
-            } else {
-              debugLog(eLabel, "session.error: non-abort error, not modifying state", { sessionID, errorName: error?.name });
+            case "session.execution.failed": {
+              const errName = data.error?.name ?? "";
+              debugLog("event", "session.execution.failed", { sessionID, errorName: errName, msg: String(data.error?.message ?? "").slice(0, 200) });
+              if (/abort/i.test(errName)) {
+                s.cancelled = true;
+                s.queueOwner = false;
+                s.modelBusy = false;
+              }
+              break;
             }
-            debugLog(eLabel, "session.error: state after", snapshotState(sess));
-          }
-          return;
-        }
-
-        if (event.type === "message.updated") {
-          const info = event.properties?.info;
-          const sid = event.properties?.sessionID;
-          if (sid && info?.role === "assistant") {
-            const parts = info.parts ?? [];
-            const hasNonTextParts = parts.some((p: any) => p.type !== "text" && p.type !== "thinking");
-            const text = parts
-              .filter((p: any) => p.type === "text" && typeof p.text === "string")
-              .map((p: any) => p.text)
-              .join("\n");
-            const sess = getSession(sid);
-            if (hasNonTextParts) {
-              // Model is still working (tool calls, agent invocations, etc.)
-              sess.lastAssistantResponse = "";
-              sess.modelWorking = true;
-              debugLog(eLabel, "Assistant working (non-text parts)", { sessionID: sid, partTypes: parts.map((p: any) => p.type) });
-            } else if (text.trim()) {
-              // Pure text response - likely final
-              sess.lastAssistantResponse = text;
-              sess.modelWorking = false;
-              debugLog(eLabel, "Captured assistant text response", { sessionID: sid, len: text.length, looksComplete: looksComplete(text) });
+            case "session.execution.started": {
+              s.modelBusy = true;
+              debugLog("event", "session.execution.started", { sessionID });
+              break;
             }
-          }
-          return;
-        }
-
-        debugLog(eLabel, "Unhandled event type", { type: event.type });
-      },
-
-      "chat.message": async (input: any, output: any) => {
-        const cmNum = ++chatMessageCount;
-        const cmLabel = `chatMsg#${cmNum}`;
-
-        debugLog(cmLabel, "chat.message called", { sessionID: input.sessionID, mode: currentMode, partsCount: output.parts?.length });
-
-        if (currentMode !== "hold") {
-          debugLog(cmLabel, "EXIT: not in hold mode", { mode: currentMode });
-          return;
-        }
-        if (isInternalMessage(output.parts)) {
-          debugLog(cmLabel, "EXIT: internal message, ignoring");
-          return;
-        }
-
-        const parts = output.parts ?? [];
-        const firstText = parts.find((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
-        if (firstText) {
-          const trimmed = firstText.text.trim();
-          if (trimmed.startsWith("/queue-") || trimmed.startsWith("/queue ")) {
-            const cmdName = trimmed.replace(/^\//, "").split(/\s+/)[0];
-            const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
-            debugLog(cmLabel, "Detected queue slash command in chat", { cmdName, cmdArgs });
-            const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
-            if (result !== null) {
-              output.parts.length = 0;
-              output.parts.push(...markInternalParts([{ type: "text", text: result }]));
-              debugLog(cmLabel, "Replaced message with command result");
-              return;
+            case "session.execution.succeeded": {
+              debugLog("event", "session.execution.succeeded", { sessionID });
+              s.modelBusy = false;
+              break;
             }
+            case "session.text.started": {
+              s.textBuffer = "";
+              break;
+            }
+            case "session.text.delta": {
+              s.textBuffer += data.delta ?? "";
+              break;
+            }
+            case "session.text.ended": {
+              if (s.textBuffer.trim()) {
+                s.lastAssistantResponse = s.textBuffer;
+                s.modelWorking = false;
+                debugLog("event", "Captured assistant text response", { sessionID, len: s.textBuffer.length, looksComplete: looksComplete(s.textBuffer) });
+              }
+              s.textBuffer = "";
+              break;
+            }
+            case "session.tool.called":
+            case "session.tool.success":
+            case "session.tool.failed": {
+              // Tool activity means the model is still working; a plain-text
+              // answer afterwards is what counts as the final response.
+              s.modelWorking = true;
+              s.lastAssistantResponse = "";
+              break;
+            }
+            default:
+              break;
           }
         }
+      } catch (e: any) {
+        if (!disposed) debugLog("events", "Event stream ended", { error: String(e?.message ?? e) });
+      }
+    })();
 
-        const s = getSession(input.sessionID);
+    debugLog("setup", "Plugin setup complete", { directory: locationDir, persistPath: resolvedPersistPath });
 
-        const textParts = parts.filter((p: any) => p.type === "text");
-        const allSystemReminders = textParts.every((p: any) =>
-          typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
-        );
-        if (allSystemReminders) {
-          debugLog(cmLabel, "EXIT: all parts are system reminders");
-          return;
-        }
-
-        const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
-        if (allSynthetic) {
-          debugLog(cmLabel, "EXIT: all parts are synthetic/ignored");
-          return;
-        }
-
-        debugLog(cmLabel, "State before queue decision", { modelBusy: s.modelBusy, queueLen: s.queue.length, queueOwner: s.queueOwner });
-
-        if (!s.modelBusy) {
-          debugLog(cmLabel, "Model NOT busy → letting message through (setting modelBusy=true)", { sessionID: input.sessionID });
-          s.modelBusy = true;
-          if (s.cancelled) {
-            debugLog(cmLabel, "Clearing stale cancelled flag (fresh user message)", { sessionID: input.sessionID });
-            s.cancelled = false;
-          }
-          debugLog(cmLabel, "State after let-through", snapshotState(s));
-          return;
-        }
-
-        debugLog(cmLabel, "Model IS busy → queuing message", { sessionID: input.sessionID, queueLenBefore: s.queue.length });
-
-        if (s.queue.length >= maxQueueSize) {
-          debugLog(cmLabel, "Queue FULL, dropping message", { maxQueueSize });
-          try {
-            await client.tui.showToast({
-              body: {
-                title: "Message Queue",
-                message: `Queue full (${maxQueueSize} max). Message dropped.`,
-                variant: "error",
-                duration: emptyToastDurationMs * 3,
-              },
-            });
-          } catch { }
-          const placeholder = makePlaceholder(output.parts, s.queue.length, `Queue full; dropped.`);
-          if (placeholder) {
-            output.parts.length = 0;
-            output.parts.push(placeholder);
-          }
-          return;
-        }
-
-        const originalParts = [...output.parts];
-        const queuedParts = originalParts.map(toPromptPart).filter((p: any) => p !== null);
-        const preview = extractPreview(queuedParts);
-
-        s.queue.push({
-          sessionID: input.sessionID,
-          agent: input.agent ?? output.message?.agent,
-          model: input.model ?? output.message?.model,
-          system: output.message?.system,
-          tools: output.message?.tools,
-          messageID: input.messageID,
-          variant: input.variant,
-          parts: queuedParts,
-          preview,
-          status: "queued",
-          retries: 0,
-          enqueuedAt: Date.now(),
-        });
-
-        const queueSize = getPendingCount(s.queue);
-        const placeholder = makePlaceholder(originalParts, queueSize, placeholderTemplate);
-        if (placeholder) {
-          output.parts.length = 0;
-          output.parts.push(placeholder);
-        }
-
-        debugLog(cmLabel, "Message enqueued", { preview, queueSize, queueLenAfter: s.queue.length, state: snapshotState(s) });
-
-        schedulePersist();
-        try {
-          await showToast(input.sessionID);
-        } catch { }
-      },
-    };
-  },
-};
+    // Cleanup: abort event loop, close watcher, flush state.
+    return () => {
+      disposed = true;
+      controller.abort();
+      try { fileWatcher?.close?.(); } catch { }
+      if (pollTimer) clearInterval(pollTimer);
+      if (persistTimer) clearTimeout(persistTimer);
+      persistState().catch(() => { });
+      debugLog("setup", "Plugin cleanup complete", { directory: locationDir });
+    };  },
+});
 
 export default AutoQueuePlugin;
