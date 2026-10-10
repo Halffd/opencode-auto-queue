@@ -1,11 +1,15 @@
 // Smoke test for opencode-auto-queue (V2 plugin API).
 //
-// Verifies with a mock plugin context:
+// The plugin does not own a queue: OpenCode v2 does. It flips the admission
+// delivery of a prompt from "steer" to "queue" while the session is busy, and
+// mirrors what the session inbox holds. These checks pin that contract:
+//
 // 1. setup completes and registers tool + commands + prompt hook
-// 2. first prompt passes through (sets busy)
-// 3. second prompt while busy is queued and admission is blocked
-// 4. idle transition drains the queue via session.prompt
-// 5. completion detection pauses queued "continue" items
+// 2. first prompt on an idle session is left alone
+// 3. a prompt on a busy session is flipped to delivery "queue" and mirrored
+// 4. the plugin never re-sends parked prompts (no session.prompt on drain)
+// 5. inbox events keep the mirror in sync (enqueued / delivered / cancelled)
+// 6. append parks new text through the session inbox
 //
 // Run: bun test/smoke.ts
 
@@ -29,7 +33,7 @@ function emit(ev: any) {
 }
 
 const mockCtx = {
-  options: { persistQueue: false, drainDelayMs: 0, retryBaseDelayMs: 1, retryMaxDelayMs: 1 },
+  options: { persistQueue: false },
   location: { directory: tmp },
   tool: {
     transform: async (cb: any) => {
@@ -68,87 +72,92 @@ const mockCtx = {
 cleanup = await AutoQueuePlugin.setup(mockCtx);
 if (typeof cleanup !== "function") throw new Error("setup must return a cleanup function");
 if (!registeredTools.some((t) => t.name === "queue")) throw new Error("queue tool not registered");
-if (Object.keys(registeredCommands).length !== 17) throw new Error(`expected 17 commands, got ${Object.keys(registeredCommands).length}`);
+if (Object.keys(registeredCommands).length !== 9) throw new Error(`expected 9 commands, got ${Object.keys(registeredCommands).length}`);
 if (typeof promptHook !== "function") throw new Error("prompt hook not registered");
 console.log("PASS setup registers tool, commands, and prompt hook");
 
 const sid = "ses_smoke";
-
-// 2. first prompt passes through (model idle -> optimistic busy)
-await promptHook({ sessionID: sid, prompt: { text: "do the task" } });
-if (promptCalls.length !== 0) throw new Error("first message should not be queued");
-console.log("PASS first message passes through");
-
-// 3. second prompt while busy -> queued + admission blocked via throw
-let queued = false;
-try {
-  await promptHook({ sessionID: sid, prompt: { text: "continue" } });
-} catch (e: any) {
-  queued = e instanceof Error && e.message.includes("queued by opencode-auto-queue");
-}
-if (!queued) throw new Error("second message while busy must throw to block admission");
-console.log("PASS second message queued, admission blocked");
-
-// 3b. tool reports the queued item
 const queueTool = registeredTools.find((t) => t.name === "queue")!;
-const statusRes = await queueTool.execute({ action: "status", args: "" }, { sessionID: sid });
-if (!String((statusRes as any).content).includes("Queued: 1")) throw new Error(`status should show 1 queued: ${JSON.stringify(statusRes)}`);
-console.log("PASS queue tool sees the queued item");
 
-// 4. idle transition drains the queue
-emit({ type: "session.status", data: { sessionID: sid, status: { type: "idle" } } });
-await new Promise((r) => setTimeout(r, 100));
-if (promptCalls.length !== 1) throw new Error(`expected 1 drained prompt, got ${promptCalls.length}`);
-if (promptCalls[0].text !== "continue") throw new Error(`drained wrong text: ${JSON.stringify(promptCalls[0])}`);
-if (promptCalls[0].sessionID !== sid) throw new Error("drained prompt missing sessionID");
-console.log("PASS idle drain sends queued item via session.prompt");
+// 2. idle session: prompt is left exactly as the client sent it
+const first = { sessionID: sid, messageID: "msg_1", delivery: "steer", prompt: { text: "do the task" } };
+await promptHook(first);
+if (first.delivery !== "steer") throw new Error(`idle prompt must stay steer, got ${first.delivery}`);
+if (first.prompt.text !== "do the task") throw new Error("idle prompt text must not be rewritten");
+console.log("PASS idle prompt is left untouched");
 
-// 5. completion detection: assistant says done, queued continues -> paused, no drain
-await promptHook({ sessionID: sid, prompt: { text: "continue" } }); // idle now -> passes through, sets busy
-let blocked = 0;
-for (const text of ["continue", "continue"]) {
-  try {
-    await promptHook({ sessionID: sid, prompt: { text } });
-  } catch { blocked++; }
+// 3. busy session: prompt is parked by flipping delivery, text untouched
+emit({ type: "session.status", data: { sessionID: sid, status: { type: "busy" } } });
+await new Promise((r) => setTimeout(r, 20));
+
+const second = { sessionID: sid, messageID: "msg_2", delivery: "steer", prompt: { text: "and then this" } };
+await promptHook(second);
+if (second.delivery !== "queue") throw new Error(`busy prompt must be flipped to queue, got ${second.delivery}`);
+if (second.prompt.text !== "and then this") throw new Error("queued prompt text must not be rewritten");
+
+const countRes = await queueTool.execute({ action: "count", args: "" }, { sessionID: sid });
+if (!String((countRes as any).content).includes("1 parked")) {
+  throw new Error(`mirror should hold 1 parked message: ${JSON.stringify(countRes)}`);
 }
-if (blocked !== 2) throw new Error(`expected 2 blocked messages, got ${blocked}`);
+console.log("PASS busy prompt is parked in the session inbox, mirror counts it");
 
-// assistant produces a completion-looking final text, then goes idle
-emit({ type: "session.text.started", data: { sessionID: sid } });
-emit({ type: "session.text.delta", data: { sessionID: sid, delta: "All tasks are complete. " } });
-emit({ type: "session.text.delta", data: { sessionID: sid, delta: "Nothing remaining to do." } });
-emit({ type: "session.text.ended", data: { sessionID: sid } });
-emit({ type: "session.status", data: { sessionID: sid, status: { type: "idle" } } });
-await new Promise((r) => setTimeout(r, 100));
-const drainAfterComplete = promptCalls.length;
-if (drainAfterComplete !== 1) throw new Error(`completion detection failed: drained ${drainAfterComplete - 1} extra item(s)`);
-const statusAfterComplete = await queueTool.execute({ action: "status", args: "" }, { sessionID: sid });
-if (!String((statusAfterComplete as any).content).includes("Paused: true")) {
-  throw new Error(`completion detection should pause the queue: ${JSON.stringify(statusAfterComplete)}`);
+// 3b. a prompt the client already queued is mirrored but not re-flipped
+const third = { sessionID: sid, messageID: "msg_3", delivery: "queue", prompt: { text: "third" } };
+await promptHook(third);
+const peekRes = await queueTool.execute({ action: "peek", args: "" }, { sessionID: sid });
+if (!String((peekRes as any).content).includes("and then this")) {
+  throw new Error(`peek should show the oldest parked message: ${JSON.stringify(peekRes)}`);
 }
-console.log("PASS completion detection pauses queued continues");
+console.log("PASS client-queued prompt is mirrored without a second flip");
 
-// 6. resume drains non-continue items even after a completion-looking response
-//    (V1 parity: queued "continue"s stay paused while the last response looks
-//    complete; other items drain normally.)
-await registeredCommands["queue-clear"].execute({ sessionID: sid, prompt: { text: "" }, delivery: "steer" });
-await registeredCommands["queue-append"].execute({ sessionID: sid, prompt: { text: "next task please" }, delivery: "steer" });
-await registeredCommands["queue-resume"].execute({ sessionID: sid, prompt: { text: "" }, delivery: "steer" });
-await new Promise((r) => setTimeout(r, 200));
-if (promptCalls.length !== 2) throw new Error(`resume should drain non-continue item, got ${promptCalls.length - 1} drained total`);
-if (promptCalls[1].text !== "next task please") throw new Error(`drained wrong item: ${JSON.stringify(promptCalls[1])}`);
-console.log("PASS resume drains non-continue item after completion pause");
-
-// 7. cancel prevents further drains
-await registeredCommands["queue-append"].execute({ sessionID: sid, prompt: { text: "should not send" }, delivery: "steer" });
-await registeredCommands["queue-cancel"].execute({ sessionID: sid, prompt: { text: "" }, delivery: "steer" });
+// 4. the plugin never re-sends parked prompts
+emit({ type: "session.inbox.delivered", data: { sessionID: sid, inboxID: "msg_2" } });
 emit({ type: "session.status", data: { sessionID: sid, status: { type: "idle" } } });
-await new Promise((r) => setTimeout(r, 100));
-if (promptCalls.length !== 2) throw new Error(`cancel should prevent drains, got ${promptCalls.length - 2} extra`);
-console.log("PASS cancel stops queue drain");
+await new Promise((r) => setTimeout(r, 50));
+if (promptCalls.length !== 0) throw new Error(`plugin must not re-send parked prompts, got ${promptCalls.length} sends`);
+console.log("PASS plugin does not re-send parked prompts on idle");
 
-// 8. cleanup runs without throwing
-await cleanup!();
-console.log("PASS cleanup runs");
+// 5. inbox events drive the mirror
+const countAfterDeliver = await queueTool.execute({ action: "count", args: "" }, { sessionID: sid });
+if (!String((countAfterDeliver as any).content).includes("1 parked")) {
+  throw new Error(`delivered item should leave the mirror: ${JSON.stringify(countAfterDeliver)}`);
+}
+emit({
+  type: "session.inbox.enqueued",
+  data: {
+    sessionID: sid,
+    inboxID: "msg_9",
+    item: { type: "user", delivery: "queue", payload: { text: "from the client" }, time: { created: Date.now() } },
+  },
+});
+emit({ type: "session.inbox.cancelled", data: { sessionID: sid, inboxID: "msg_3" } });
+await new Promise((r) => setTimeout(r, 50));
+const countAfterEvents = await queueTool.execute({ action: "count", args: "" }, { sessionID: sid });
+if (!String((countAfterEvents as any).content).includes("1 parked")) {
+  throw new Error(`enqueued/cancelled events should leave exactly the client item: ${JSON.stringify(countAfterEvents)}`);
+}
+const listRes = await queueTool.execute({ action: "list", args: "" }, { sessionID: sid });
+if (!String((listRes as any).content).includes("from the client")) {
+  throw new Error(`list should show the client-queued item: ${JSON.stringify(listRes)}`);
+}
+console.log("PASS inbox enqueued/delivered/cancelled events keep the mirror in sync");
 
+// 6. append parks text through the session inbox instead of sending it
+const appendRes = await queueTool.execute({ action: "append", args: "run the tests" }, { sessionID: sid });
+if (promptCalls.length !== 1) throw new Error(`append must send exactly one prompt, got ${promptCalls.length}`);
+if (promptCalls[0].delivery !== "queue") throw new Error(`append must use delivery queue, got ${promptCalls[0].delivery}`);
+if (promptCalls[0].text !== "run the tests") throw new Error(`append sent wrong text: ${promptCalls[0].text}`);
+if (!String((appendRes as any).content).includes("Queued:")) throw new Error("append should confirm it queued");
+console.log("PASS append parks text through the session inbox");
+
+// 7. immediate mode stops flipping deliveries
+emit({ type: "session.status", data: { sessionID: sid, status: { type: "busy" } } });
+await queueTool.execute({ action: "immediate", args: "" }, { sessionID: sid });
+await new Promise((r) => setTimeout(r, 20));
+const steerInImmediate = { sessionID: sid, messageID: "msg_10", delivery: "steer", prompt: { text: "now" } };
+await promptHook(steerInImmediate);
+if (steerInImmediate.delivery !== "steer") throw new Error("immediate mode must not flip delivery");
+console.log("PASS immediate mode leaves delivery alone");
+
+cleanup?.();
 console.log("ALL SMOKE TESTS PASSED");
