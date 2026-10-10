@@ -902,10 +902,8 @@ export const AutoQueuePlugin = Plugin.define({
       if (disposed) return;
       const sessionID: string = event.sessionID;
       if (!sessionID) return;
-      const text: string = event.prompt?.text ?? "";
-      const files = event.prompt?.files;
-      const agents = event.prompt?.agents;
 
+      // Allow our own drain prompts to pass through unmodified
       if (sendingNow.has(sessionID)) {
         debugLog("prompt", "EXIT: our own drain prompt, passing through", { sessionID });
         return;
@@ -917,6 +915,18 @@ export const AutoQueuePlugin = Plugin.define({
       }
 
       const s = getSession(sessionID);
+      const prompt = event.prompt ?? {};
+
+      // If the prompt is internal (drain), skip queueing
+      if (prompt.metadata?.internal) {
+        debugLog("prompt", "EXIT: internal prompt, passing through", { sessionID });
+        return;
+      }
+
+      const text: string = prompt.text ?? "";
+      const files = prompt.files;
+      const agents = prompt.agents;
+      const skills = prompt.skills;
 
       if (!s.modelBusy) {
         debugLog("prompt", "Model NOT busy -> letting message through (setting modelBusy=true)", { sessionID });
@@ -931,9 +941,14 @@ export const AutoQueuePlugin = Plugin.define({
       debugLog("prompt", "Model IS busy -> queuing message", { sessionID, queueLenBefore: s.queue.length });
 
       if (s.queue.length >= maxQueueSize) {
-        debugLog("prompt", "Queue FULL, dropping message", { sessionID, maxQueueSize });
+        debugLog("prompt", "Queue FULL, replacing with placeholder", { sessionID, maxQueueSize });
         await notify(sessionID, `Queue full (${maxQueueSize} max). Message dropped.`);
-        throw new QueuedByAutoQueueError(s.queue.length);
+        // Replace the user's message with a placeholder so it is not lost
+        event.prompt.text = `Queue full (${maxQueueSize} max). Message dropped.`;
+        event.prompt.files = [];
+        event.prompt.agents = [];
+        event.prompt.skills = [];
+        return;
       }
 
       const item: QueuedItem = {
@@ -949,14 +964,17 @@ export const AutoQueuePlugin = Plugin.define({
       s.queue.push(item);
       schedulePersist();
 
-      debugLog("prompt", "Message enqueued, blocking admission", {
+      const pending = getPendingCount(s.queue);
+      debugLog("prompt", "Message enqueued, replacing with placeholder", {
         sessionID, preview: item.preview, queueLenAfter: s.queue.length,
       });
-      await notify(sessionID, `Queued (${getPendingCount(s.queue)} pending): ${item.preview}`);
+      await notify(sessionID, `Queued (${pending} pending): ${item.preview}`);
 
-      // Blocking admission is how a queued prompt is "swallowed": the hook
-      // throwing fails preparation, so OpenCode does not admit the prompt.
-      throw new QueuedByAutoQueueError(getPendingCount(s.queue));
+      // Replace the user's message with a placeholder to prevent it from being sent now.
+      event.prompt.text = `Queued; ${pending} pending`;
+      event.prompt.files = [];
+      event.prompt.agents = [];
+      event.prompt.skills = [];
     });
 
     // ---------------------------------------------------------------
