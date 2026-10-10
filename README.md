@@ -18,6 +18,36 @@ That also means it never rewrites your text. Earlier versions swapped the
 message for a `Queued; N pending` placeholder, which the model then answered as
 a real prompt.
 
+Upstream: [anomalyco/opencode#5408](https://github.com/anomalyco/opencode/issues/5408)
+(delayed queue, shipped in [#40922](https://github.com/anomalyco/opencode/pull/40922)),
+[anomalyco/opencode#47229](https://github.com/anomalyco/opencode/issues/47229)
+(expose more v2 session APIs to plugins).
+
+## Versions
+
+| Tag | Line | Target |
+|-----|------|--------|
+| `v1` | plugin-owned queue, `chat.message` hook | OpenCode v1 |
+| `v2` | session-inbox delivery flip | OpenCode v2.0.x |
+
+## How it works
+
+`ctx.session.hook("prompt", …)` runs before the server admits the prompt, and
+the hook input carries the delivery the client asked for. In hold mode, when
+the session is busy:
+
+```ts
+event.delivery = "queue"; // the server parks it; nothing is rewritten
+```
+
+Everything after that is the server's: it delivers parked messages one at a
+time once the session is idle. Throwing from the hook instead — the v2 port's
+first attempt — surfaces as `Failed to send prompt UnexpectedStatus: 500`,
+because the hook has no way to refuse admission.
+
+The plugin mirrors what is parked from the `session.inbox.*` events for
+`status` / `peek` / `count` and for `.git/queue.json`.
+
 ## Features
 
 - **Hold / immediate modes** — park prompts while busy, or keep steering
@@ -37,7 +67,7 @@ detection, pause/resume/cancel drain, reorder/insert/prepend/delete/set/sort/
 invert, and `q.py` driving the queue file — were removed rather than left
 behind as commands that silently do nothing.
 
-Tracked upstream as *expose more v2 session APIs to plugins*.
+Tracked upstream as [#47229](https://github.com/anomalyco/opencode/issues/47229).
 
 ## Installation
 
@@ -47,6 +77,14 @@ In `opencode.json`:
 {
   "plugin": ["file:///absolute/path/to/opencode-auto-queue"]
 }
+```
+
+The plugin is discovered from `~/.config/opencode/plugins/` as well; a symlink
+from there to the checkout is enough. OpenCode v2 loads the root `index.js`,
+so `dist/` must be built:
+
+```bash
+bun install && bun build src/index.ts --outdir dist --target bun
 ```
 
 ## Tool
